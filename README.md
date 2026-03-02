@@ -247,6 +247,15 @@ ADMIN_PASSWORD='你的强密码' pnpm dev:core
 curl -fsSL https://raw.githubusercontent.com/smdk000/qq-farm-ui-pro-max/main/deploy.sh -o deploy.sh && chmod +x deploy.sh && ./deploy.sh up
 ```
 
+### 💡 部署疑难排查 (数据库连接报错)
+
+如果一键部署完成后，日志里一直提示 `数据库未初始化` 或不断重试连接 MySQL/Redis 失败，这通常是由于**首次启动**时，Docker 还没来得及初始化完成这台宿主机器的全新 MySQL 表结构与权限导致 App 容器并网超时。
+
+> [!TIP]
+> **解决方案**：只要您的内核不是重度不支持的，这种网络超时都是假超时（硬编码参数现已全自动跟随 `.env` 环境变量）。您可以先等待几分钟让 MySQL 日志不动，然后：
+> 1. 第一步：运行 `docker restart qq-farm-app` 重启一下微服务节点（让它二次挂载到 MySQL 并建立连接）。
+> 2. 第二步：执行 `docker logs -f qq-farm-app`，只要看到 `✅ MySQL 数据库连接池初始化成功` 结合 `✅ Redis PING 验证成功` 的绿勾字样，这就代表数据库网关已全部成功并网！
+
 **该脚本的魔力在于：**
 1. 自动探明您的服务器系统架构，智能拉取匹配的底层容器。
 2. 自动为您由于环境缺失而补充安装 Docker 与 Docker Compose。
