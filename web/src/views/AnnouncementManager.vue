@@ -40,8 +40,10 @@ const modalConfig = ref({
   type: 'primary' as 'primary' | 'danger',
   isAlert: true,
 })
+const pendingAction = ref<(() => void) | null>(null)
 
 function showAlert(message: string, type: 'primary' | 'danger' = 'primary') {
+  pendingAction.value = null
   modalConfig.value = {
     title: type === 'danger' ? '错误' : '提示',
     message,
@@ -49,6 +51,30 @@ function showAlert(message: string, type: 'primary' | 'danger' = 'primary') {
     isAlert: true,
   }
   modalVisible.value = true
+}
+
+function showConfirm(message: string, onConfirm: () => void, type: 'primary' | 'danger' = 'danger') {
+  pendingAction.value = onConfirm
+  modalConfig.value = {
+    title: '确认操作',
+    message,
+    type,
+    isAlert: false,
+  }
+  modalVisible.value = true
+}
+
+function handleModalConfirm() {
+  modalVisible.value = false
+  if (pendingAction.value) {
+    pendingAction.value()
+    pendingAction.value = null
+  }
+}
+
+function handleModalCancel() {
+  modalVisible.value = false
+  pendingAction.value = null
 }
 
 async function loadAnnouncements() {
@@ -106,43 +132,48 @@ async function saveAnnouncement() {
   }
 }
 
-async function deleteAnnouncement(id: number) {
-  if (!window.confirm('确定要彻底删除此公告吗？操作不可恢复。')) return
-  loading.value = true
-  try {
-    const res = await api.delete(`/api/announcement?id=${id}`)
-    if (res.data.ok) {
-      showAlert('公告已删除')
-      await loadAnnouncements()
+function deleteAnnouncement(id: number) {
+  showConfirm('确定要彻底删除此公告吗？操作不可恢复。', async () => {
+    loading.value = true
+    try {
+      const res = await api.delete(`/api/announcement?id=${id}`)
+      if (res.data.ok) {
+        showAlert('公告已删除')
+        await loadAnnouncements()
+      }
+      else {
+        showAlert(`删除失败: ${res.data.error}`, 'danger')
+      }
     }
-    else {
-      showAlert(`删除失败: ${res.data.error}`, 'danger')
+    catch (e: any) {
+      showAlert(`删除失败: ${e.message}`, 'danger')
     }
-  }
-  catch (e: any) {
-    showAlert(`删除失败: ${e.message}`, 'danger')
-  }
-  finally {
-    loading.value = false
-  }
+    finally {
+      loading.value = false
+    }
+  })
 }
 
-async function syncFromLog() {
-  if (!window.confirm('是否从系统后端的 Update.log 解析并导入缺失的内容作为公告？')) return
-  syncing.value = true
-  try {
-    const res = await api.post('/api/announcement/sync')
-    if (res.data.ok) {
-      showAlert(`同步成功！在 Update.log 共发现 ${res.data.totalParsed} 条系统日志，实际新增插入了 ${res.data.added} 条（已去重）。`)
-      await loadAnnouncements()
-    } else {
-      showAlert(`同步失败: ${res.data.error}`, 'danger')
+function syncFromLog() {
+  showConfirm('是否从系统后端的 Update.log 解析并导入缺失的内容作为公告？', async () => {
+    syncing.value = true
+    try {
+      const res = await api.post('/api/announcement/sync')
+      if (res.data.ok) {
+        showAlert(`同步成功！在 Update.log 共发现 ${res.data.totalParsed} 条系统日志，实际新增插入了 ${res.data.added} 条（已去重）。`)
+        await loadAnnouncements()
+      }
+      else {
+        showAlert(`同步失败: ${res.data.error}`, 'danger')
+      }
     }
-  } catch (e: any) {
-    showAlert(`同步操作失败: ${e.message}`, 'danger')
-  } finally {
-    syncing.value = false
-  }
+    catch (e: any) {
+      showAlert(`同步操作失败: ${e.message}`, 'danger')
+    }
+    finally {
+      syncing.value = false
+    }
+  }, 'primary')
 }
 
 onMounted(() => {
@@ -306,9 +337,9 @@ onMounted(() => {
       :message="modalConfig.message"
       :type="modalConfig.type"
       :is-alert="modalConfig.isAlert"
-      confirm-text="知道了"
-      @confirm="modalVisible = false"
-      @cancel="modalVisible = false"
+      :confirm-text="modalConfig.isAlert ? '知道了' : '确定'"
+      @confirm="handleModalConfirm"
+      @cancel="handleModalCancel"
     />
   </div>
 </template>
