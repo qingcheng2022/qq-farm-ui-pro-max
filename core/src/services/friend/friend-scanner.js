@@ -554,7 +554,7 @@ async function visitFriend(friend, totalActions, myGid) {
 }
 
 
-async function checkFriends() {
+async function checkFriends(mode = 'full') {
     const state = getUserState();
 
     if (state.suspendUntil && Date.now() < state.suspendUntil) {
@@ -570,9 +570,13 @@ async function checkFriends() {
 
     if (!isAutomationOn('friend')) return false;
 
-    const helpEnabled = !!isAutomationOn('friend_help');
-    let stealEnabled = !!isAutomationOn('friend_steal');
-    const badEnabled = !!isAutomationOn('friend_bad');
+    const normalizedMode = new Set(['full', 'help', 'steal']).has(String(mode || '')) ? String(mode) : 'full';
+    const baseHelpEnabled = !!isAutomationOn('friend_help');
+    const baseStealEnabled = !!isAutomationOn('friend_steal');
+    const baseBadEnabled = !!isAutomationOn('friend_bad');
+    const helpEnabled = normalizedMode === 'steal' ? false : baseHelpEnabled;
+    let stealEnabled = normalizedMode === 'help' ? false : baseStealEnabled;
+    const badEnabled = normalizedMode === 'help' ? baseBadEnabled : false;
 
     const platformInst = PlatformFactory.createPlatform(CONFIG.platform);
 
@@ -596,7 +600,7 @@ async function checkFriends() {
         }
 
         // 三阶段模式：扫描→偷菜→帮助（通过 friend_three_phase 开关控制）
-        const useThreePhase = !!isAutomationOn('friend_three_phase');
+        const useThreePhase = normalizedMode === 'full' && !!isAutomationOn('friend_three_phase');
         if (useThreePhase && stealEnabled) {
             return await checkFriendsThreePhase(friends, state, helpEnabled, badEnabled);
         }
@@ -718,7 +722,7 @@ async function checkFriends() {
 
         if (summary.length > 0) {
             log('好友', `巡查 ${friendsToVisit.length} 人 → ${summary.join('/')}`, {
-                module: 'friend', event: 'friend_cycle', result: 'ok', visited: friendsToVisit.length, summary
+                module: 'friend', event: 'friend_cycle', result: 'ok', visited: friendsToVisit.length, summary, mode: normalizedMode
             });
         }
         consecutiveErrors = 0; // 完成所有判定，视为正常操作

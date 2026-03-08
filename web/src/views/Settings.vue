@@ -14,7 +14,7 @@ import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
 import { useFarmStore } from '@/stores/farm'
 import { useFriendStore } from '@/stores/friend'
-import { useSettingStore } from '@/stores/setting'
+import { type ReportLogEntry, useSettingStore } from '@/stores/setting'
 
 const settingStore = useSettingStore()
 const appStore = useAppStore()
@@ -23,7 +23,7 @@ const accountStore = useAccountStore()
 const farmStore = useFarmStore()
 const friendStore = useFriendStore()
 
-const { settings, loading } = storeToRefs(settingStore)
+const { settings, loading, reportLogs, reportLogPagination } = storeToRefs(settingStore)
 const { currentAccountId, accounts } = storeToRefs(accountStore)
 const { seeds } = storeToRefs(farmStore)
 const { friends } = storeToRefs(friendStore)
@@ -33,6 +33,23 @@ const passwordSaving = ref(false)
 const offlineSaving = ref(false)
 const trialSaving = ref(false)
 const timingSaving = ref(false)
+const reportTesting = ref(false)
+const reportSendingMode = ref<'hourly' | 'daily' | ''>('')
+const reportHistoryLoading = ref(false)
+const reportHistoryClearing = ref(false)
+const reportHistoryExporting = ref(false)
+const reportHistoryBatchDeleting = ref(false)
+const reportHistoryDeletingIds = ref<number[]>([])
+const expandedReportLogIds = ref<number[]>([])
+const selectedReportLogIds = ref<number[]>([])
+const reportDetailVisible = ref(false)
+const reportDetailItem = ref<ReportLogEntry | null>(null)
+const reportFilters = ref({
+  mode: 'all',
+  status: 'all',
+})
+const reportKeyword = ref('')
+const reportPageSize = ref(10)
 
 // === 危险频率拦截警告 ===
 const timeWarningVisible = computed(() => {
@@ -40,12 +57,16 @@ const timeWarningVisible = computed(() => {
   if (!localSettings.value.intervals)
     return false
   // eslint-disable-next-line ts/no-use-before-define
-  const { farmMin, farmMax, friendMin, friendMax } = localSettings.value.intervals
+  const { farmMin, farmMax, friendMin, friendMax, helpMin, helpMax, stealMin, stealMax } = localSettings.value.intervals
   return (
     (typeof farmMin === 'number' && farmMin < 15)
     || (typeof farmMax === 'number' && farmMax < 15)
     || (typeof friendMin === 'number' && friendMin < 60)
     || (typeof friendMax === 'number' && friendMax < 60)
+    || (typeof helpMin === 'number' && helpMin < 60)
+    || (typeof helpMax === 'number' && helpMax < 60)
+    || (typeof stealMin === 'number' && stealMin < 60)
+    || (typeof stealMax === 'number' && stealMax < 60)
   )
 })
 
@@ -223,14 +244,89 @@ const currentAccountName = computed(() => {
   return acc ? (acc.name || acc.nick || acc.id) : null
 })
 
+const defaultReportConfig = {
+  enabled: false,
+  channel: 'webhook',
+  endpoint: '',
+  token: '',
+  title: '经营汇报',
+  hourlyEnabled: false,
+  hourlyMinute: 5,
+  dailyEnabled: true,
+  dailyHour: 21,
+  dailyMinute: 0,
+  retentionDays: 30,
+}
+
+const reportModeOptions = [
+  { label: '全部类型', value: 'all' },
+  { label: '测试汇报', value: 'test' },
+  { label: '小时汇报', value: 'hourly' },
+  { label: '日报', value: 'daily' },
+]
+
+const reportStatusOptions = [
+  { label: '全部结果', value: 'all' },
+  { label: '仅成功', value: 'success' },
+  { label: '仅失败', value: 'failed' },
+]
+
+const reportPageSizeOptions = [
+  { label: '10 条/页', value: 10 },
+  { label: '20 条/页', value: 20 },
+  { label: '50 条/页', value: 50 },
+  { label: '100 条/页', value: 100 },
+]
+
+const defaultIntervals = {
+  farmMin: 30,
+  farmMax: 200,
+  friendMin: 100,
+  friendMax: 600,
+  helpMin: 100,
+  helpMax: 600,
+  stealMin: 100,
+  stealMax: 600,
+}
+
+const defaultTradeConfig = {
+  sell: {
+    scope: 'fruit_only' as const,
+    keepMinEachFruit: 0,
+    keepFruitIds: [] as number[],
+    rareKeep: {
+      enabled: false,
+      judgeBy: 'either' as 'plant_level' | 'unit_price' | 'either',
+      minPlantLevel: 40,
+      minUnitPrice: 2000,
+    },
+    batchSize: 15,
+    previewBeforeManualSell: false,
+  },
+}
+
+const selectedReportLogCount = computed(() => selectedReportLogIds.value.length)
+const allVisibleReportLogsSelected = computed(() => (
+  reportLogs.value.length > 0
+  && reportLogs.value.every(item => selectedReportLogIds.value.includes(item.id))
+))
+
 const localSettings = ref({
   accountMode: 'main' as 'main' | 'alt' | 'safe',
   harvestDelay: { min: 180, max: 300 },
   plantingStrategy: 'preferred',
   preferredSeedId: 0,
-  intervals: { farmMin: 30, farmMax: 200, friendMin: 100, friendMax: 600 },
+  intervals: { ...defaultIntervals },
   friendQuietHours: { enabled: true, start: '23:00', end: '07:00' },
   stakeoutSteal: { enabled: false, delaySec: 3 },
+  tradeConfig: {
+    sell: {
+      ...defaultTradeConfig.sell,
+      keepFruitIds: [...defaultTradeConfig.sell.keepFruitIds],
+      rareKeep: { ...defaultTradeConfig.sell.rareKeep },
+    },
+  },
+  reportConfig: { ...defaultReportConfig },
   automation: {
     farm: false,
     task: false,
@@ -238,6 +334,7 @@ const localSettings = ref({
     friend: false,
     farm_push: false,
     land_upgrade: false,
+    landUpgradeTarget: 6,
     friend_steal: false,
     friend_help: false,
     friend_bad: false,
@@ -263,9 +360,11 @@ const localSettings = ref({
     friend_auto_accept: false,
     fertilizer_60s_anti_steal: false,
     fertilizer_smart_phase: false,
+    fastHarvest: false,
     forceGetAllEnabled: false,
   },
 })
+const tradeKeepFruitIdsText = ref('')
 
 const localOffline = ref({
   channel: 'webhook',
@@ -300,9 +399,34 @@ function syncLocalSettings() {
       harvestDelay: (settings.value as any).harvestDelay || { min: 180, max: 300 },
       plantingStrategy: settings.value.plantingStrategy,
       preferredSeedId: settings.value.preferredSeedId,
-      intervals: settings.value.intervals,
+      intervals: {
+        ...defaultIntervals,
+        ...(settings.value.intervals || {}),
+      },
       friendQuietHours: settings.value.friendQuietHours,
       stakeoutSteal: (settings.value as any).stakeoutSteal || { enabled: false, delaySec: 3 },
+      tradeConfig: ((settings.value as any).tradeConfig || {}).sell
+        ? {
+            sell: {
+              ...defaultTradeConfig.sell,
+              ...(((settings.value as any).tradeConfig || {}).sell || {}),
+              keepFruitIds: Array.isArray((((settings.value as any).tradeConfig || {}).sell || {}).keepFruitIds)
+                ? [ ...((((settings.value as any).tradeConfig || {}).sell || {}).keepFruitIds) ]
+                : [],
+              rareKeep: {
+                ...defaultTradeConfig.sell.rareKeep,
+                ...((((((settings.value as any).tradeConfig || {}).sell || {}).rareKeep) || {})),
+              },
+            },
+          }
+        : {
+        sell: {
+          ...defaultTradeConfig.sell,
+          keepFruitIds: [...defaultTradeConfig.sell.keepFruitIds],
+          rareKeep: { ...defaultTradeConfig.sell.rareKeep },
+        },
+      },
+      reportConfig: (settings.value as any).reportConfig || defaultReportConfig,
       automation: settings.value.automation,
     }))
 
@@ -315,6 +439,7 @@ function syncLocalSettings() {
         friend: false,
         farm_push: false,
         land_upgrade: false,
+        landUpgradeTarget: 6,
         friend_steal: false,
         friend_help: false,
         friend_bad: false,
@@ -340,6 +465,7 @@ function syncLocalSettings() {
         friend_auto_accept: false,
         fertilizer_60s_anti_steal: false,
         fertilizer_smart_phase: false,
+        fastHarvest: false,
         forceGetAllEnabled: false,
       }
     }
@@ -352,6 +478,7 @@ function syncLocalSettings() {
         friend: false,
         farm_push: false,
         land_upgrade: false,
+        landUpgradeTarget: 6,
         friend_steal: false,
         friend_help: false,
         friend_bad: false,
@@ -377,6 +504,7 @@ function syncLocalSettings() {
         friend_auto_accept: false,
         fertilizer_60s_anti_steal: false,
         fertilizer_smart_phase: false,
+        fastHarvest: false,
         forceGetAllEnabled: false,
       }
       localSettings.value.automation = {
@@ -389,11 +517,48 @@ function syncLocalSettings() {
       localSettings.value.stakeoutSteal = { enabled: false, delaySec: 3 }
     }
 
+    localSettings.value.reportConfig = {
+      ...defaultReportConfig,
+      ...(localSettings.value.reportConfig || {}),
+    }
+    localSettings.value.intervals = {
+      ...defaultIntervals,
+      ...(localSettings.value.intervals || {}),
+    }
+    const currentSellConfig = ((localSettings.value.tradeConfig || {}).sell || {}) as any
+    const currentRareKeep = (currentSellConfig.rareKeep || {}) as any
+    localSettings.value.tradeConfig = {
+      sell: {
+        ...defaultTradeConfig.sell,
+        ...currentSellConfig,
+        keepFruitIds: Array.isArray(currentSellConfig.keepFruitIds) ? currentSellConfig.keepFruitIds : [],
+        rareKeep: {
+          ...defaultTradeConfig.sell.rareKeep,
+          ...currentRareKeep,
+        },
+      },
+    }
+    tradeKeepFruitIdsText.value = ((localSettings.value.tradeConfig.sell.keepFruitIds || []) as number[]).join(', ')
+
     // Sync offline settings (global)
     if (settings.value.offlineReminder) {
       localOffline.value = JSON.parse(JSON.stringify(settings.value.offlineReminder))
     }
   }
+}
+
+function buildSettingsPayload() {
+  const payload = JSON.parse(JSON.stringify(localSettings.value))
+  const ids = String(tradeKeepFruitIdsText.value || '')
+    .split(/[\s,，]+/)
+    .map(v => Number(v))
+    .filter(v => Number.isFinite(v) && v > 0)
+  if (!payload.tradeConfig)
+    payload.tradeConfig = { sell: {} }
+  if (!payload.tradeConfig.sell)
+    payload.tradeConfig.sell = {}
+  payload.tradeConfig.sell.keepFruitIds = Array.from(new Set(ids))
+  return payload
 }
 
 // 策略预设应用函数
@@ -423,7 +588,17 @@ function applyPreset(type: 'conservative' | 'balanced' | 'aggressive') {
   }
 
   if (type === 'conservative') {
-    localSettings.value.intervals = { farmMin: 300, farmMax: 600, friendMin: 900, friendMax: 1200 }
+    localSettings.value.intervals = {
+      ...defaultIntervals,
+      farmMin: 300,
+      farmMax: 600,
+      friendMin: 900,
+      friendMax: 1200,
+      helpMin: 900,
+      helpMax: 1200,
+      stealMin: 900,
+      stealMax: 1200,
+    }
     localSettings.value.friendQuietHours = { enabled: true, start: '23:00', end: '07:00' }
     localSettings.value.automation = {
       ...localSettings.value.automation,
@@ -436,7 +611,17 @@ function applyPreset(type: 'conservative' | 'balanced' | 'aggressive') {
     showAlert('已应用【保守配置】：最高安全性，建议主号使用。', 'primary')
   }
   else if (type === 'balanced') {
-    localSettings.value.intervals = { farmMin: 180, farmMax: 300, friendMin: 600, friendMax: 900 }
+    localSettings.value.intervals = {
+      ...defaultIntervals,
+      farmMin: 180,
+      farmMax: 300,
+      friendMin: 600,
+      friendMax: 900,
+      helpMin: 600,
+      helpMax: 900,
+      stealMin: 600,
+      stealMax: 900,
+    }
     localSettings.value.friendQuietHours = { enabled: true, start: '23:00', end: '07:00' }
     localSettings.value.automation = {
       ...localSettings.value.automation,
@@ -451,7 +636,17 @@ function applyPreset(type: 'conservative' | 'balanced' | 'aggressive') {
     showAlert('已应用【平衡配置】：兼顾收益与安全，强烈推荐！', 'primary')
   }
   else if (type === 'aggressive') {
-    localSettings.value.intervals = { farmMin: 120, farmMax: 180, friendMin: 300, friendMax: 600 }
+    localSettings.value.intervals = {
+      ...defaultIntervals,
+      farmMin: 120,
+      farmMax: 180,
+      friendMin: 300,
+      friendMax: 600,
+      helpMin: 300,
+      helpMax: 600,
+      stealMin: 300,
+      stealMax: 600,
+    }
     localSettings.value.friendQuietHours = { enabled: true, start: '00:00', end: '06:00' }
     localSettings.value.automation = {
       ...localSettings.value.automation,
@@ -495,6 +690,7 @@ async function handleSafeCheck() {
 async function loadData() {
   if (currentAccountId.value) {
     await settingStore.fetchSettings(currentAccountId.value)
+    await refreshReportLogs()
     syncLocalSettings()
     // Always fetch seeds to ensure correct locked status for current account
     await farmStore.fetchSeeds(currentAccountId.value)
@@ -502,6 +698,10 @@ async function loadData() {
     if (localSettings.value.automation.stealFriendFilterEnabled && friends.value.length === 0) {
       friendStore.fetchFriends(currentAccountId.value)
     }
+  }
+  else {
+    reportLogs.value = []
+    reportLogPagination.value = { page: 1, pageSize: reportPageSize.value || 10, total: 0, totalPages: 1 }
   }
   // 管理员加载体验卡配置
   loadTrialConfig()
@@ -572,7 +772,8 @@ const channelOptions = [
 const reloginUrlModeOptions = [
   { label: '不需要', value: 'none' },
   { label: 'QQ直链', value: 'qq_link' },
-  { label: '二维码链接', value: 'qr_link' },
+  { label: '二维码图片', value: 'qr_code' },
+  { label: '直链 + 二维码', value: 'all' },
 ]
 
 // 推送渠道官方文档链接
@@ -600,6 +801,10 @@ const CHANNEL_DOCS: Record<string, string> = {
 
 const channelDocUrl = computed(() => {
   return CHANNEL_DOCS[localOffline.value.channel] || ''
+})
+
+const reportChannelDocUrl = computed(() => {
+  return CHANNEL_DOCS[localSettings.value.reportConfig.channel] || ''
 })
 
 const preferredSeedOptions = computed(() => {
@@ -675,6 +880,7 @@ const fieldLabels: Record<string, string> = {
   friend: '自动好友互动',
   farm_push: '推送触发巡田',
   land_upgrade: '自动升级土地',
+  landUpgradeTarget: '土地升级目标等级',
   friend_steal: '自动偷菜',
   friend_help: '自动帮忙',
   friend_bad: '自动捣乱',
@@ -685,6 +891,7 @@ const fieldLabels: Record<string, string> = {
   fertilizer_gift: '自动填充化肥',
   fertilizer_buy: '自动购买化肥',
   fertilizer_60s_anti_steal: '60秒施肥(防偷)',
+  fastHarvest: '成熟秒收取',
   free_gifts: '自动商城礼包',
   share_reward: '自动分享奖励',
   vip_gift: '自动VIP礼包',
@@ -759,7 +966,7 @@ async function saveAccountSettings(force: any = false) {
   diffModalVisible.value = false
   saving.value = true
   try {
-    const res = await settingStore.saveSettings(currentAccountId.value, localSettings.value)
+    const res = await settingStore.saveSettings(currentAccountId.value, buildSettingsPayload())
     if (res.ok) {
       showAlert('账号设置已保存')
     }
@@ -821,6 +1028,307 @@ async function handleSaveOffline() {
     offlineSaving.value = false
   }
 }
+
+async function handleSendReportTest() {
+  if (!currentAccountId.value)
+    return
+  reportTesting.value = true
+  try {
+    const saveRes = await settingStore.saveSettings(currentAccountId.value, buildSettingsPayload())
+    if (!saveRes.ok) {
+      showAlert(`保存汇报配置失败: ${saveRes.error || '未知错误'}`, 'danger')
+      return
+    }
+
+    const res = await settingStore.sendReportTest(currentAccountId.value)
+    if (res.ok) {
+      await refreshReportLogs()
+      showAlert('测试汇报已发送，请检查目标渠道')
+    }
+    else {
+      showAlert(`测试发送失败: ${res.error || '未知错误'}`, 'danger')
+    }
+  }
+  finally {
+    reportTesting.value = false
+  }
+}
+
+async function handleSendReport(mode: 'hourly' | 'daily') {
+  if (!currentAccountId.value)
+    return
+  reportSendingMode.value = mode
+  try {
+    const saveRes = await settingStore.saveSettings(currentAccountId.value, buildSettingsPayload())
+    if (!saveRes.ok) {
+      showAlert(`保存汇报配置失败: ${saveRes.error || '未知错误'}`, 'danger')
+      return
+    }
+
+    const res = await settingStore.sendReport(currentAccountId.value, mode)
+    if (res.ok) {
+      await refreshReportLogs()
+      showAlert(mode === 'hourly' ? '小时汇报已发送' : '日报已发送')
+    }
+    else {
+      showAlert(`发送失败: ${res.error || '未知错误'}`, 'danger')
+    }
+  }
+  finally {
+    reportSendingMode.value = ''
+  }
+}
+
+async function refreshReportLogs(options: { page?: number, pageSize?: number, resetPage?: boolean } = {}) {
+  if (!currentAccountId.value)
+    return
+  reportHistoryLoading.value = true
+  try {
+    const targetPage = options.resetPage ? 1 : (options.page || reportLogPagination.value.page || 1)
+    const targetPageSize = options.pageSize || reportPageSize.value || 10
+    await settingStore.fetchReportLogs(currentAccountId.value, {
+      page: targetPage,
+      pageSize: targetPageSize,
+      mode: reportFilters.value.mode,
+      status: reportFilters.value.status,
+      keyword: reportKeyword.value.trim(),
+    })
+    reportPageSize.value = reportLogPagination.value.pageSize || reportPageSize.value || 10
+  }
+  finally {
+    reportHistoryLoading.value = false
+  }
+}
+
+async function goToReportLogPage(page: number) {
+  if (!currentAccountId.value)
+    return
+  if (page < 1 || page > (reportLogPagination.value.totalPages || 1))
+    return
+  await refreshReportLogs({ page })
+}
+
+async function handleClearReportLogs() {
+  if (!currentAccountId.value)
+    return
+  if (!window.window.confirm('是否清空当前账号的全部经营汇报历史记录？此操作不可恢复。'))
+    return
+  reportHistoryClearing.value = true
+  try {
+    const res = await settingStore.clearReportLogs(currentAccountId.value)
+    if (res.ok) {
+      await refreshReportLogs({ resetPage: true })
+      showAlert('经营汇报历史已清空')
+    }
+    else {
+      showAlert(`清空失败: ${res.error || '未知错误'}`, 'danger')
+    }
+  }
+  finally {
+    reportHistoryClearing.value = false
+  }
+}
+
+async function handleExportReportLogs() {
+  if (!currentAccountId.value)
+    return
+  reportHistoryExporting.value = true
+  try {
+    const res = await settingStore.exportReportLogs(currentAccountId.value, {
+      mode: reportFilters.value.mode,
+      status: reportFilters.value.status,
+      keyword: reportKeyword.value.trim(),
+    })
+    if (!res.ok || !res.blob) {
+      showAlert(`导出失败: ${res.error || '未知错误'}`, 'danger')
+      return
+    }
+    const url = window.URL.createObjectURL(res.blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = res.filename || 'report-history.csv'
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    window.URL.revokeObjectURL(url)
+    if (res.truncated) {
+      showAlert(`导出完成：已导出 ${res.count} 条记录（当前筛选共 ${res.total} 条，导出上限 2000 条）`)
+    }
+    else {
+      showAlert(`导出完成：已导出 ${res.count} 条记录`)
+    }
+  }
+  finally {
+    reportHistoryExporting.value = false
+  }
+}
+
+async function handleApplyReportSearch() {
+  expandedReportLogIds.value = []
+  selectedReportLogIds.value = []
+  closeReportLogDetail()
+  await refreshReportLogs({ resetPage: true })
+}
+
+function isReportLogSelected(id: number) {
+  return selectedReportLogIds.value.includes(id)
+}
+
+function toggleReportLogSelected(id: number) {
+  if (isReportLogSelected(id)) {
+    selectedReportLogIds.value = selectedReportLogIds.value.filter(itemId => itemId !== id)
+  }
+  else {
+    selectedReportLogIds.value = [...selectedReportLogIds.value, id]
+  }
+}
+
+function toggleSelectAllVisibleReportLogs() {
+  if (allVisibleReportLogsSelected.value) {
+    const visibleIds = new Set(reportLogs.value.map(item => item.id))
+    selectedReportLogIds.value = selectedReportLogIds.value.filter(id => !visibleIds.has(id))
+  }
+  else {
+    const next = new Set(selectedReportLogIds.value)
+    for (const item of reportLogs.value) {
+      next.add(item.id)
+    }
+    selectedReportLogIds.value = Array.from(next)
+  }
+}
+
+async function refreshReportLogsAfterDelete(deletedIds: number[]) {
+  const visibleDeletedCount = reportLogs.value.filter(item => deletedIds.includes(item.id)).length
+  const currentPage = reportLogPagination.value.page || 1
+  const shouldFallbackPage = visibleDeletedCount >= reportLogs.value.length && currentPage > 1
+  await refreshReportLogs({ page: shouldFallbackPage ? currentPage - 1 : currentPage })
+  if (reportLogs.value.length === 0 && (reportLogPagination.value.page || 1) > 1) {
+    await refreshReportLogs({ page: (reportLogPagination.value.page || 1) - 1 })
+  }
+}
+
+async function handleDeleteReportLogs(ids: number[], options: { single?: boolean, title?: string } = {}) {
+  if (!currentAccountId.value)
+    return
+  const normalizedIds = Array.from(new Set(ids.map(id => Number(id)).filter(id => Number.isFinite(id) && id > 0)))
+  if (normalizedIds.length === 0)
+    return
+  const titleText = options.title || (options.single ? '这条汇报记录' : `这 ${normalizedIds.length} 条汇报记录`)
+  if (!window.window.confirm(`是否删除${titleText}？此操作不可恢复。`))
+    return
+
+  if (options.single) {
+    reportHistoryDeletingIds.value = normalizedIds
+  }
+  else {
+    reportHistoryBatchDeleting.value = true
+  }
+
+  try {
+    const res = await settingStore.deleteReportLogsByIds(currentAccountId.value, normalizedIds)
+    if (!res.ok) {
+      showAlert(`删除失败: ${res.error || '未知错误'}`, 'danger')
+      return
+    }
+    selectedReportLogIds.value = selectedReportLogIds.value.filter(id => !normalizedIds.includes(id))
+    if (reportDetailItem.value && normalizedIds.includes(reportDetailItem.value.id)) {
+      closeReportLogDetail()
+    }
+    await refreshReportLogsAfterDelete(normalizedIds)
+    showAlert(options.single ? '汇报记录已删除' : `已删除 ${normalizedIds.length} 条汇报记录`)
+  }
+  finally {
+    reportHistoryDeletingIds.value = reportHistoryDeletingIds.value.filter(id => !normalizedIds.includes(id))
+    reportHistoryBatchDeleting.value = false
+  }
+}
+
+function formatReportMode(mode: string) {
+  if (mode === 'hourly')
+    return '小时汇报'
+  if (mode === 'daily')
+    return '日报'
+  return '测试汇报'
+}
+
+function formatReportLogTime(value: string) {
+  if (!value)
+    return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime()))
+    return String(value)
+  const yyyy = date.getFullYear()
+  const mm = String(date.getMonth() + 1).padStart(2, '0')
+  const dd = String(date.getDate()).padStart(2, '0')
+  const hh = String(date.getHours()).padStart(2, '0')
+  const mi = String(date.getMinutes()).padStart(2, '0')
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}`
+}
+
+function getReportLogPreview(content: string) {
+  const text = String(content || '').trim()
+  if (!text)
+    return '无正文'
+  const lines = text.split('\n')
+  if (lines.length > 4)
+    return `${lines.slice(0, 4).join('\n')}\n...`
+  if (text.length > 220)
+    return `${text.slice(0, 220)}...`
+  return text
+}
+
+function isReportLogExpanded(id: number) {
+  return expandedReportLogIds.value.includes(id)
+}
+
+function toggleReportLogExpanded(id: number) {
+  if (isReportLogExpanded(id)) {
+    expandedReportLogIds.value = expandedReportLogIds.value.filter(itemId => itemId !== id)
+  }
+  else {
+    expandedReportLogIds.value = [...expandedReportLogIds.value, id]
+  }
+}
+
+function openReportLogDetail(item: ReportLogEntry) {
+  reportDetailItem.value = { ...item }
+  reportDetailVisible.value = true
+}
+
+function closeReportLogDetail() {
+  reportDetailVisible.value = false
+  reportDetailItem.value = null
+}
+
+watch(() => [currentAccountId.value, reportFilters.value.mode, reportFilters.value.status], ([accountId]) => {
+  expandedReportLogIds.value = []
+  selectedReportLogIds.value = []
+  closeReportLogDetail()
+  if (!accountId)
+    return
+  void refreshReportLogs({ resetPage: true })
+})
+
+watch(() => reportPageSize.value, (pageSize, prevPageSize) => {
+  expandedReportLogIds.value = []
+  selectedReportLogIds.value = []
+  closeReportLogDetail()
+  if (!currentAccountId.value)
+    return
+  if (pageSize === prevPageSize)
+    return
+  void refreshReportLogs({ resetPage: true, pageSize: pageSize || 10 })
+})
+
+watch(() => reportLogs.value.map(item => item.id).join(','), () => {
+  const visibleIds = new Set(reportLogs.value.map(item => item.id))
+  expandedReportLogIds.value = expandedReportLogIds.value.filter(id => visibleIds.has(id))
+  selectedReportLogIds.value = selectedReportLogIds.value.filter(id => visibleIds.has(id))
+  reportHistoryDeletingIds.value = reportHistoryDeletingIds.value.filter(id => visibleIds.has(id))
+  if (reportDetailItem.value && !visibleIds.has(reportDetailItem.value.id)) {
+    closeReportLogDetail()
+  }
+})
 
 async function loadTimingConfig() {
   if (!isAdmin.value)
@@ -1021,7 +1529,7 @@ async function restoreTimingDefaults() {
             <div class="i-carbon-warning-alt mt-0.5 shrink-0 text-lg" />
             <div>
               <strong>危险的轮询设定！</strong><br>
-              农田循环下限不能低于 15秒，好友巡查不能低于 60秒，否则极易触发腾讯风控致使账号被封。请上调参数后再保存！
+              农田循环下限不能低于 15秒，好友/帮忙/偷菜巡查不能低于 60秒，否则极易触发腾讯风控致使账号被封。请上调参数后再保存！
             </div>
           </div>
 
@@ -1046,7 +1554,7 @@ async function restoreTimingDefaults() {
             </div>
           </div>
 
-          <div class="grid grid-cols-2 gap-3 md:grid-cols-4">
+          <div class="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-6">
             <BaseInput
               v-model.number="localSettings.intervals.farmMin"
               label="农场巡查最小 (秒)"
@@ -1068,6 +1576,30 @@ async function restoreTimingDefaults() {
             <BaseInput
               v-model.number="localSettings.intervals.friendMax"
               label="好友巡查最大 (秒)"
+              type="number"
+              min="1"
+            />
+            <BaseInput
+              v-model.number="localSettings.intervals.helpMin"
+              label="帮忙最小 (秒)"
+              type="number"
+              min="1"
+            />
+            <BaseInput
+              v-model.number="localSettings.intervals.helpMax"
+              label="帮忙最大 (秒)"
+              type="number"
+              min="1"
+            />
+            <BaseInput
+              v-model.number="localSettings.intervals.stealMin"
+              label="偷菜最小 (秒)"
+              type="number"
+              min="1"
+            />
+            <BaseInput
+              v-model.number="localSettings.intervals.stealMax"
+              label="偷菜最大 (秒)"
               type="number"
               min="1"
             />
@@ -1094,6 +1626,89 @@ async function restoreTimingDefaults() {
               />
             </div>
           </div>
+
+          <div class="mt-4 border-t pt-4 dark:border-gray-700">
+            <div class="mb-3">
+              <h4 class="text-sm font-semibold">
+                出售策略
+              </h4>
+              <p class="mt-1 text-xs text-gray-500">
+                当前自动出售仅作用于果实类物品。可配置保留数量、指定白名单以及稀有果实保留规则。
+              </p>
+            </div>
+
+            <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
+              <BaseInput
+                v-model.number="localSettings.tradeConfig.sell.keepMinEachFruit"
+                label="每种果实至少保留"
+                type="number"
+                min="0"
+              />
+              <BaseInput
+                v-model.number="localSettings.tradeConfig.sell.batchSize"
+                label="出售批大小"
+                type="number"
+                min="1"
+                max="50"
+              />
+              <BaseSelect
+                v-model="localSettings.tradeConfig.sell.rareKeep.judgeBy"
+                label="稀有判定方式"
+                :options="[
+                  { label: '任一条件命中', value: 'either' },
+                  { label: '按作物等级', value: 'plant_level' },
+                  { label: '按果实单价', value: 'unit_price' },
+                ]"
+              />
+            </div>
+
+            <div class="mt-3">
+              <label class="mb-1 block text-xs text-gray-500 font-semibold">
+                强制保留果实 ID（逗号或空格分隔）
+              </label>
+              <textarea
+                v-model="tradeKeepFruitIdsText"
+                rows="2"
+                class="w-full border border-gray-200 rounded-lg bg-white/70 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-900/40"
+                placeholder="例如：2001, 2002, 2003"
+              />
+            </div>
+
+            <div class="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
+              <div class="rounded-xl border border-gray-200/70 p-4 dark:border-gray-700/70">
+                <BaseSwitch
+                  v-model="localSettings.tradeConfig.sell.rareKeep.enabled"
+                  label="启用稀有果实保留"
+                />
+                <div class="mt-3 grid grid-cols-2 gap-3">
+                  <BaseInput
+                    v-model.number="localSettings.tradeConfig.sell.rareKeep.minPlantLevel"
+                    label="最低作物等级"
+                    type="number"
+                    min="0"
+                    :disabled="!localSettings.tradeConfig.sell.rareKeep.enabled"
+                  />
+                  <BaseInput
+                    v-model.number="localSettings.tradeConfig.sell.rareKeep.minUnitPrice"
+                    label="最低单价"
+                    type="number"
+                    min="0"
+                    :disabled="!localSettings.tradeConfig.sell.rareKeep.enabled"
+                  />
+                </div>
+              </div>
+
+              <div class="rounded-xl border border-gray-200/70 p-4 dark:border-gray-700/70">
+                <BaseSwitch
+                  v-model="localSettings.tradeConfig.sell.previewBeforeManualSell"
+                  label="手动出售前先刷新预览"
+                />
+                <p class="mt-2 text-xs text-gray-500">
+                  背包页手动出售时会先刷新出售计划，避免在你改动保留策略后直接误卖。
+                </p>
+              </div>
+            </div>
+          </div>
         </div>
 
         <!-- Auto Control Header -->
@@ -1117,7 +1732,22 @@ async function restoreTimingDefaults() {
               <div class="space-y-4">
                 <BaseSwitch v-model="localSettings.automation.farm" label="自动种植收获" hint="核心总开关。自动巡查农场：成熟即收、空地即种、异常即处理（浇水/除草/除虫/铲除枯死）。关闭后所有农场自动化停止。" recommend="on" />
                 <BaseSwitch v-model="localSettings.automation.friend" label="自动好友互动" hint="好友巡查总开关。开启后按下方子策略遍历好友农场执行操作（偷菜/帮忙/捣乱）。关闭则所有好友互动停止。" recommend="on" />
-                <BaseSwitch v-model="localSettings.automation.land_upgrade" label="自动升级土地" hint="金币充足且满足条件时自动升级土地等级，可提高产量。升级花费较大，金币紧张时建议关闭。" recommend="conditional" />
+                <div class="flex flex-col gap-2">
+                  <BaseSwitch v-model="localSettings.automation.land_upgrade" label="自动升级土地" hint="金币充足且满足条件时自动升级土地等级，可提高产量。升级花费较大，金币紧张时建议关闭。" recommend="conditional" />
+                  <div v-show="localSettings.automation.land_upgrade" class="ml-7 flex items-center gap-3">
+                    <span class="glass-text-muted text-[11px] font-bold tracking-widest uppercase">
+                      - 最高升级到：
+                    </span>
+                    <BaseInput
+                      v-model.number="localSettings.automation.landUpgradeTarget"
+                      type="number"
+                      min="0"
+                      max="6"
+                      class="w-24 text-sm shadow-inner !py-1"
+                    />
+                    <span class="text-xs text-gray-500 dark:text-gray-400">0=普通，6=蓝宝石</span>
+                  </div>
+                </div>
                 <BaseSwitch v-model="localSettings.automation.sell" label="自动卖果实" hint="收获后自动将仓库中的果实出售换取金币。关闭则果实堆积在仓库不处理。" recommend="on" />
                 <BaseSwitch v-model="localSettings.automation.farm_push" label="推送触发巡田" hint="收到外部事件（如消息推送）时立即触发一次农场巡查，而非等待定时轮询，提高响应灵敏度。" recommend="on" />
               </div>
@@ -1165,6 +1795,7 @@ async function restoreTimingDefaults() {
                   </div>
                 </div>
                 <BaseSwitch v-model="localSettings.automation.fertilizer_60s_anti_steal" label="60秒施肥(防偷)" hint="核心防盗功能。在果实成熟前60秒内自动施肥催熟并瞬间收获，将被偷窗口压缩到接近0。需消耗化肥，主号必开。" recommend="on" />
+                <BaseSwitch v-model="localSettings.automation.fastHarvest" label="成熟秒收取" hint="在作物进入成熟前预设定时任务，约提前 200ms 发起收获请求，尽量压缩被偷窗口。和 60 秒施肥防偷可并存。" recommend="conditional" />
                 <BaseSwitch v-model="localSettings.automation.fertilizer_smart_phase" label="智能二季施肥" hint="开启后，二季作物刚种植时不会马上浪费化肥，而是等到耗时最长的黄金阶段再自动进行延期施肥，实现单果经验/金钱收益最大化。" recommend="conditional" />
                 <div class="border-t pt-2 dark:border-gray-700/50">
                   <BaseSelect
@@ -1250,6 +1881,385 @@ async function restoreTimingDefaults() {
             >
               前往偷菜控制台 <div class="i-carbon-arrow-right ml-2" />
             </BaseButton>
+          </div>
+
+          <div class="border border-emerald-100/60 rounded-2xl bg-emerald-50/40 p-5 dark:border-emerald-800/40 dark:bg-emerald-950/10">
+            <div class="mb-4 flex items-center justify-between gap-3">
+              <h4 class="flex items-center gap-2 text-xs text-emerald-700 font-bold tracking-widest uppercase dark:text-emerald-300">
+                <div class="i-carbon-report-data mr-1" /> 经营汇报
+              </h4>
+              <div class="flex flex-wrap gap-2">
+                <BaseButton
+                  variant="secondary"
+                  size="sm"
+                  :loading="reportSendingMode === 'hourly'"
+                  @click="handleSendReport('hourly')"
+                >
+                  立即发小时汇报
+                </BaseButton>
+                <BaseButton
+                  variant="secondary"
+                  size="sm"
+                  :loading="reportSendingMode === 'daily'"
+                  @click="handleSendReport('daily')"
+                >
+                  立即发日报
+                </BaseButton>
+                <BaseButton
+                  variant="secondary"
+                  size="sm"
+                  :loading="reportTesting"
+                  @click="handleSendReportTest"
+                >
+                  发送测试汇报
+                </BaseButton>
+              </div>
+            </div>
+
+            <div class="space-y-4">
+              <BaseSwitch
+                v-model="localSettings.reportConfig.enabled"
+                label="启用经营汇报"
+                hint="按设定周期向推送渠道发送账号经营摘要。默认复用你在这里填写的专属推送参数，不影响全局下线提醒。"
+                recommend="conditional"
+              />
+
+              <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <div class="flex items-center gap-2">
+                  <BaseSelect
+                    v-model="localSettings.reportConfig.channel"
+                    label="推送渠道"
+                    :options="channelOptions"
+                    class="flex-1"
+                  />
+                  <a
+                    v-if="reportChannelDocUrl"
+                    :href="reportChannelDocUrl"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="mt-5 inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-emerald-100 px-2 py-1.5 text-xs text-emerald-700 font-medium transition dark:bg-emerald-900/30 hover:bg-emerald-200 dark:text-emerald-300 dark:hover:bg-emerald-800/40"
+                    title="查看官方文档"
+                  >
+                    <span class="i-carbon-launch text-xs" />
+                    官网
+                  </a>
+                </div>
+                <BaseInput
+                  v-model="localSettings.reportConfig.title"
+                  label="汇报标题"
+                  type="text"
+                  placeholder="经营汇报"
+                />
+              </div>
+
+              <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <BaseInput
+                  v-model="localSettings.reportConfig.endpoint"
+                  label="接口地址"
+                  type="text"
+                  :disabled="localSettings.reportConfig.channel !== 'webhook'"
+                  placeholder="Webhook 渠道必填"
+                />
+                <BaseInput
+                  v-model="localSettings.reportConfig.token"
+                  label="Token"
+                  type="text"
+                  placeholder="非 Webhook 渠道通常必填"
+                />
+              </div>
+
+              <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <div class="rounded-xl border border-emerald-200/60 bg-white/50 p-4 dark:border-emerald-800/30 dark:bg-black/10">
+                  <BaseSwitch
+                    v-model="localSettings.reportConfig.hourlyEnabled"
+                    label="小时汇报"
+                    hint="到达指定分钟后，发送最近 1 小时的收益与动作摘要。"
+                    recommend="conditional"
+                  />
+                  <div class="mt-3 flex items-center gap-3">
+                    <span class="glass-text-muted text-[11px] font-bold tracking-widest uppercase">每小时第</span>
+                    <BaseInput
+                      v-model.number="localSettings.reportConfig.hourlyMinute"
+                      type="number"
+                      min="0"
+                      max="59"
+                      class="w-24 text-sm shadow-inner !py-1"
+                      :disabled="!localSettings.reportConfig.hourlyEnabled"
+                    />
+                    <span class="text-xs text-gray-500 dark:text-gray-400">分钟发送</span>
+                  </div>
+                </div>
+
+                <div class="rounded-xl border border-emerald-200/60 bg-white/50 p-4 dark:border-emerald-800/30 dark:bg-black/10">
+                  <BaseSwitch
+                    v-model="localSettings.reportConfig.dailyEnabled"
+                    label="每日汇报"
+                    hint="按设定时刻发送今日累计经营摘要，适合晚间复盘。"
+                    recommend="on"
+                  />
+                  <div class="mt-3 flex items-center gap-3">
+                    <span class="glass-text-muted text-[11px] font-bold tracking-widest uppercase">每天</span>
+                    <BaseInput
+                      v-model.number="localSettings.reportConfig.dailyHour"
+                      type="number"
+                      min="0"
+                      max="23"
+                      class="w-24 text-sm shadow-inner !py-1"
+                      :disabled="!localSettings.reportConfig.dailyEnabled"
+                    />
+                    <span class="text-xs text-gray-500 dark:text-gray-400">时</span>
+                    <BaseInput
+                      v-model.number="localSettings.reportConfig.dailyMinute"
+                      type="number"
+                      min="0"
+                      max="59"
+                      class="w-24 text-sm shadow-inner !py-1"
+                      :disabled="!localSettings.reportConfig.dailyEnabled"
+                    />
+                    <span class="text-xs text-gray-500 dark:text-gray-400">分发送</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="rounded-xl border border-emerald-200/60 bg-white/50 p-4 dark:border-emerald-800/30 dark:bg-black/10">
+                <div class="mb-2 flex items-center gap-2 text-xs text-emerald-700 font-bold tracking-widest uppercase dark:text-emerald-300">
+                  <div class="i-carbon-data-base mr-1" /> 历史保留策略
+                </div>
+                <div class="flex items-center gap-3">
+                  <span class="glass-text-muted text-[11px] font-bold tracking-widest uppercase">自动保留</span>
+                  <BaseInput
+                    v-model.number="localSettings.reportConfig.retentionDays"
+                    type="number"
+                    min="0"
+                    max="365"
+                    class="w-24 text-sm shadow-inner !py-1"
+                  />
+                  <span class="text-xs text-gray-500 dark:text-gray-400">天</span>
+                </div>
+                <p class="mt-2 text-xs text-gray-500 leading-relaxed dark:text-gray-400">
+                  填 <span class="font-bold">0</span> 表示不自动清理；填 1~365 表示系统每天自动清理一次过期汇报，并在每次发送后顺手回收当前账号的旧记录。
+                </p>
+              </div>
+
+              <div class="border-t border-emerald-200/60 pt-4 dark:border-emerald-800/30">
+                <div class="mb-3 flex items-center justify-between gap-3">
+                  <h5 class="text-xs text-emerald-700 font-bold tracking-widest uppercase dark:text-emerald-300">
+                    最近汇报记录
+                  </h5>
+                  <div class="flex flex-wrap gap-2">
+                    <BaseButton
+                      variant="secondary"
+                      size="sm"
+                      :disabled="selectedReportLogCount === 0"
+                      :loading="reportHistoryBatchDeleting"
+                      @click="handleDeleteReportLogs(selectedReportLogIds)"
+                    >
+                      删除选中
+                    </BaseButton>
+                    <BaseButton
+                      variant="secondary"
+                      size="sm"
+                      :loading="reportHistoryExporting"
+                      @click="handleExportReportLogs"
+                    >
+                      导出当前筛选
+                    </BaseButton>
+                    <BaseButton
+                      variant="secondary"
+                      size="sm"
+                      :loading="reportHistoryLoading"
+                      @click="() => refreshReportLogs()"
+                    >
+                      刷新记录
+                    </BaseButton>
+                    <BaseButton
+                      variant="secondary"
+                      size="sm"
+                      :loading="reportHistoryClearing"
+                      @click="handleClearReportLogs"
+                    >
+                      清空记录
+                    </BaseButton>
+                  </div>
+                </div>
+
+                <div class="mb-3 grid grid-cols-1 gap-3 md:grid-cols-4">
+                  <BaseSelect
+                    v-model="reportFilters.mode"
+                    label="筛选类型"
+                    :options="reportModeOptions"
+                  />
+                  <BaseSelect
+                    v-model="reportFilters.status"
+                    label="筛选结果"
+                    :options="reportStatusOptions"
+                  />
+                  <BaseSelect
+                    v-model="reportPageSize"
+                    label="每页条数"
+                    :options="reportPageSizeOptions"
+                  />
+                  <BaseInput
+                    v-model="reportKeyword"
+                    label="关键字搜索"
+                    type="text"
+                    placeholder="标题 / 正文 / 失败原因"
+                    @keydown.enter="handleApplyReportSearch"
+                  />
+                </div>
+
+                <div class="mb-3 flex flex-wrap items-end justify-between gap-3">
+                  <div class="text-xs text-gray-500 dark:text-gray-400">
+                    <span v-if="reportKeyword.trim()">当前关键字：{{ reportKeyword.trim() }}</span>
+                    <span v-else>未启用关键字搜索</span>
+                  </div>
+                  <div class="flex flex-wrap gap-2">
+                    <BaseButton
+                      variant="secondary"
+                      size="sm"
+                      @click="handleApplyReportSearch"
+                    >
+                      搜索
+                    </BaseButton>
+                    <BaseButton
+                      variant="secondary"
+                      size="sm"
+                      :disabled="!reportKeyword"
+                      @click="reportKeyword = ''; handleApplyReportSearch()"
+                    >
+                      清空搜索
+                    </BaseButton>
+                  </div>
+                </div>
+
+                <div class="mb-3 flex flex-wrap items-center justify-between gap-3 text-xs text-gray-500 dark:text-gray-400">
+                  <div class="flex flex-wrap items-center gap-3">
+                    <span>
+                      共 {{ reportLogPagination.total }} 条记录，当前第 {{ reportLogPagination.page }} / {{ reportLogPagination.totalPages }} 页
+                    </span>
+                    <label class="inline-flex items-center gap-2 select-none">
+                      <input
+                        type="checkbox"
+                        class="h-4 w-4 rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
+                        :checked="allVisibleReportLogsSelected"
+                        @change="toggleSelectAllVisibleReportLogs"
+                      >
+                      <span>全选当前页</span>
+                    </label>
+                    <span v-if="selectedReportLogCount > 0" class="text-emerald-600 font-semibold dark:text-emerald-300">
+                      已选 {{ selectedReportLogCount }} 条
+                    </span>
+                  </div>
+                  <div class="flex gap-2">
+                    <BaseButton
+                      variant="secondary"
+                      size="sm"
+                      :disabled="reportHistoryLoading || reportLogPagination.page <= 1"
+                      @click="goToReportLogPage(reportLogPagination.page - 1)"
+                    >
+                      上一页
+                    </BaseButton>
+                    <BaseButton
+                      variant="secondary"
+                      size="sm"
+                      :disabled="reportHistoryLoading || reportLogPagination.page >= reportLogPagination.totalPages"
+                      @click="goToReportLogPage(reportLogPagination.page + 1)"
+                    >
+                      下一页
+                    </BaseButton>
+                  </div>
+                </div>
+
+                <div v-if="reportHistoryLoading" class="rounded-xl border border-dashed border-emerald-200/70 bg-white/40 px-4 py-5 text-center text-xs text-gray-500 dark:border-emerald-800/30 dark:bg-black/10 dark:text-gray-400">
+                  正在加载汇报历史...
+                </div>
+
+                <div v-else-if="reportLogs.length === 0" class="rounded-xl border border-dashed border-emerald-200/70 bg-white/40 px-4 py-5 text-center text-xs text-gray-500 dark:border-emerald-800/30 dark:bg-black/10 dark:text-gray-400">
+                  还没有经营汇报历史记录
+                </div>
+
+                <div v-else class="space-y-3">
+                  <div
+                    v-for="item in reportLogs"
+                    :key="item.id"
+                    class="rounded-xl border border-emerald-200/60 bg-white/50 p-4 dark:border-emerald-800/30 dark:bg-black/10"
+                  >
+                    <div class="flex flex-wrap items-start justify-between gap-2">
+                      <div class="min-w-0 flex flex-1 items-start gap-3">
+                        <label class="mt-0.5 inline-flex items-center">
+                          <input
+                            type="checkbox"
+                            class="h-4 w-4 rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
+                            :checked="isReportLogSelected(item.id)"
+                            @change="toggleReportLogSelected(item.id)"
+                          >
+                        </label>
+                        <div class="min-w-0 flex-1">
+                          <div class="truncate text-sm text-gray-900 font-semibold dark:text-gray-100">
+                            {{ item.title || '经营汇报' }}
+                          </div>
+                          <div class="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
+                            {{ formatReportMode(item.mode) }} · {{ formatReportLogTime(item.createdAt) }} · {{ item.channel || 'unknown' }}
+                          </div>
+                        </div>
+                      </div>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <span
+                          class="rounded-full px-2 py-0.5 text-[11px] font-bold"
+                          :class="item.ok ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'"
+                        >
+                          {{ item.ok ? '成功' : '失败' }}
+                        </span>
+                        <BaseButton
+                          variant="secondary"
+                          size="sm"
+                          :loading="reportHistoryDeletingIds.includes(item.id)"
+                          @click="handleDeleteReportLogs([item.id], { single: true, title: `「${item.title || '经营汇报'}」` })"
+                        >
+                          删除
+                        </BaseButton>
+                      </div>
+                    </div>
+
+                    <div
+                      class="mt-3 overflow-auto whitespace-pre-line rounded-lg bg-black/5 px-3 py-2 text-xs leading-5 text-gray-700 dark:bg-white/5 dark:text-gray-300"
+                      :class="isReportLogExpanded(item.id) ? 'max-h-64' : 'max-h-24'"
+                    >
+                      {{ isReportLogExpanded(item.id) ? (item.content || '无正文') : getReportLogPreview(item.content) }}
+                    </div>
+
+                    <div
+                      v-if="item.errorMessage"
+                      class="mt-2 text-xs text-red-600 dark:text-red-400"
+                    >
+                      失败原因：{{ item.errorMessage }}
+                    </div>
+
+                    <div class="mt-3 flex flex-wrap items-center justify-between gap-2">
+                      <span class="text-[11px] text-gray-500 dark:text-gray-400">
+                        {{ isReportLogExpanded(item.id) ? '已展开完整正文' : '当前显示正文预览' }}
+                      </span>
+                      <div class="flex flex-wrap gap-2">
+                        <BaseButton
+                          variant="secondary"
+                          size="sm"
+                          @click="toggleReportLogExpanded(item.id)"
+                        >
+                          {{ isReportLogExpanded(item.id) ? '收起正文' : '展开正文' }}
+                        </BaseButton>
+                        <BaseButton
+                          variant="secondary"
+                          size="sm"
+                          @click="openReportLogDetail(item)"
+                        >
+                          查看详情
+                        </BaseButton>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1761,13 +2771,80 @@ async function restoreTimingDefaults() {
               </div>
             </div>
           </div>
+      </div>
+    </div>
+  </div>
+
+  <Teleport to="body">
+    <div v-if="reportDetailVisible && reportDetailItem" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div
+        class="absolute inset-0 bg-gray-900/45 backdrop-blur-sm dark:bg-black/70"
+        @click="closeReportLogDetail"
+      />
+      <div class="glass-panel relative z-10 max-h-[85vh] max-w-3xl w-full overflow-hidden border border-white/20 rounded-2xl shadow-2xl dark:border-white/10">
+        <div class="flex items-center justify-between border-b border-gray-200/50 px-6 py-4 dark:border-white/10">
+          <div class="min-w-0">
+            <h3 class="truncate text-base text-gray-900 font-bold dark:text-gray-100">
+              {{ reportDetailItem.title || '经营汇报详情' }}
+            </h3>
+            <div class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ formatReportMode(reportDetailItem.mode) }} · {{ formatReportLogTime(reportDetailItem.createdAt) }} · {{ reportDetailItem.channel || 'unknown' }}
+            </div>
+          </div>
+          <button
+            class="rounded-full p-2 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-700 dark:hover:text-gray-300"
+            @click="closeReportLogDetail"
+          >
+            <div class="i-carbon-close text-xl" />
+          </button>
+        </div>
+
+        <div class="max-h-[calc(85vh-8rem)] overflow-auto px-6 py-5 space-y-4">
+          <div class="flex flex-wrap items-center gap-2">
+            <span
+              class="rounded-full px-2.5 py-1 text-[11px] font-bold"
+              :class="reportDetailItem.ok ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'"
+            >
+              {{ reportDetailItem.ok ? '发送成功' : '发送失败' }}
+            </span>
+            <span class="rounded-full bg-gray-100 px-2.5 py-1 text-[11px] text-gray-600 dark:bg-white/10 dark:text-gray-300">
+              账号：{{ reportDetailItem.accountName || reportDetailItem.accountId || '-' }}
+            </span>
+            <span class="rounded-full bg-gray-100 px-2.5 py-1 text-[11px] text-gray-600 dark:bg-white/10 dark:text-gray-300">
+              ID：{{ reportDetailItem.accountId || '-' }}
+            </span>
+          </div>
+
+          <div v-if="reportDetailItem.errorMessage" class="rounded-xl border border-red-200/70 bg-red-50/70 px-4 py-3 text-sm text-red-700 dark:border-red-900/40 dark:bg-red-950/20 dark:text-red-300">
+            失败原因：{{ reportDetailItem.errorMessage }}
+          </div>
+
+          <div class="rounded-xl border border-emerald-200/60 bg-black/5 px-4 py-4 dark:border-emerald-800/30 dark:bg-white/5">
+            <div class="mb-2 text-xs text-gray-500 font-bold tracking-widest uppercase dark:text-gray-400">
+              完整正文
+            </div>
+            <div class="whitespace-pre-line break-words text-sm leading-6 text-gray-800 dark:text-gray-200">
+              {{ reportDetailItem.content || '无正文' }}
+            </div>
+          </div>
+        </div>
+
+        <div class="flex justify-end border-t border-gray-200/50 px-6 py-4 dark:border-white/10">
+          <BaseButton
+            variant="secondary"
+            size="sm"
+            @click="closeReportLogDetail"
+          >
+            关闭
+          </BaseButton>
         </div>
       </div>
     </div>
+  </Teleport>
 
-    <ConfirmModal
-      :show="modalVisible"
-      :title="modalConfig.title"
+  <ConfirmModal
+    :show="modalVisible"
+    :title="modalConfig.title"
       :message="modalConfig.message"
       :type="modalConfig.type"
       :is-alert="modalConfig.isAlert"

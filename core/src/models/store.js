@@ -26,6 +26,56 @@ const DEFAULT_OFFLINE_REMINDER = {
     msg: '账号下线',
     offlineDeleteSec: 0,
 };
+const DEFAULT_REPORT_CONFIG = {
+    enabled: false,
+    channel: 'webhook',
+    endpoint: '',
+    token: '',
+    title: '经营汇报',
+    hourlyEnabled: false,
+    hourlyMinute: 5,
+    dailyEnabled: true,
+    dailyHour: 21,
+    dailyMinute: 0,
+    retentionDays: 30,
+};
+const REPORT_OPERATION_KEYS = [
+    'harvest',
+    'water',
+    'weed',
+    'bug',
+    'fertilize',
+    'plant',
+    'steal',
+    'helpWater',
+    'helpWeed',
+    'helpBug',
+    'taskClaim',
+    'sell',
+    'upgrade',
+    'levelUp',
+];
+const DEFAULT_REPORT_STATE = {
+    lastHourlySlot: '',
+    lastDailySlot: '',
+    hourlyBaseline: null,
+    dailyBaseline: null,
+};
+const DEFAULT_TRADE_CONFIG = {
+    sell: {
+        scope: 'fruit_only',
+        keepMinEachFruit: 0,
+        keepFruitIds: [],
+        rareKeep: {
+            enabled: false,
+            judgeBy: 'either',
+            minPlantLevel: 40,
+            minUnitPrice: 2000,
+        },
+        batchSize: 15,
+        previewBeforeManualSell: false,
+    },
+};
 // ============ 全局配置 ============
 const DEFAULT_ACCOUNT_CONFIG = {
     automation: {
@@ -41,10 +91,14 @@ const DEFAULT_ACCOUNT_CONFIG = {
         friend_steal: true, // 偷菜
         friend_help: true,  // 帮忙
         friend_bad: false,  // 捣乱(放虫草)
+        friend_auto_accept: false,
+        friend_three_phase: false,
+        auto_blacklist_banned: true,
         task: true,
         email: true,
         fertilizer_gift: false,
         fertilizer_buy: false,
+        fertilizer_buy_limit: 100,
         free_gifts: true,
         share_reward: true,
         vip_gift: true,
@@ -52,6 +106,10 @@ const DEFAULT_ACCOUNT_CONFIG = {
         open_server_gift: true,
         sell: true,
         fertilizer: 'none',
+        fertilizer_60s_anti_steal: false,
+        fertilizer_smart_phase: false,
+        fastHarvest: false,
+        landUpgradeTarget: 6,
     },
     plantingStrategy: 'preferred',
     preferredSeedId: 0,
@@ -62,6 +120,10 @@ const DEFAULT_ACCOUNT_CONFIG = {
         farmMax: 120,
         friendMin: 60,
         friendMax: 180,
+        helpMin: 60,
+        helpMax: 180,
+        stealMin: 60,
+        stealMax: 180,
     },
     friendQuietHours: {
         enabled: false,
@@ -78,8 +140,12 @@ const DEFAULT_ACCOUNT_CONFIG = {
         farm: { enabled: false, minInterval: 30, maxInterval: 120, nodes: [] },
         friend: { enabled: false, minInterval: 60, maxInterval: 300, nodes: [] },
     },
+    tradeConfig: { ...DEFAULT_TRADE_CONFIG },
+    reportConfig: { ...DEFAULT_REPORT_CONFIG },
+    reportState: { ...DEFAULT_REPORT_STATE },
 };
 const ALLOWED_AUTOMATION_KEYS = new Set(Object.keys(DEFAULT_ACCOUNT_CONFIG.automation));
+const FERTILIZER_OPTIONS = new Set(['both', 'normal', 'organic', 'none']);
 
 let accountFallbackConfig = {
     ...DEFAULT_ACCOUNT_CONFIG,
@@ -150,6 +216,58 @@ function normalizeOfflineReminder(input) {
     };
 }
 
+function clampInteger(value, fallback, min, max) {
+    const parsed = Number.parseInt(value, 10);
+    const base = Number.isFinite(parsed) ? parsed : Number.parseInt(fallback, 10);
+    const next = Number.isFinite(base) ? base : min;
+    return Math.max(min, Math.min(max, next));
+}
+
+function normalizeReportConfig(rawConfig, fallbackConfig = DEFAULT_REPORT_CONFIG) {
+    const raw = (rawConfig && typeof rawConfig === 'object') ? rawConfig : {};
+    const fallback = (fallbackConfig && typeof fallbackConfig === 'object') ? fallbackConfig : DEFAULT_REPORT_CONFIG;
+    const rawChannel = String(raw.channel !== undefined ? raw.channel : fallback.channel || DEFAULT_REPORT_CONFIG.channel).trim().toLowerCase();
+    return {
+        enabled: raw.enabled !== undefined ? !!raw.enabled : !!fallback.enabled,
+        channel: PUSHOO_CHANNELS.has(rawChannel) ? rawChannel : DEFAULT_REPORT_CONFIG.channel,
+        endpoint: String(raw.endpoint !== undefined ? raw.endpoint : fallback.endpoint || '').trim(),
+        token: String(raw.token !== undefined ? raw.token : fallback.token || '').trim(),
+        title: String(raw.title !== undefined ? raw.title : fallback.title || DEFAULT_REPORT_CONFIG.title).trim() || DEFAULT_REPORT_CONFIG.title,
+        hourlyEnabled: raw.hourlyEnabled !== undefined ? !!raw.hourlyEnabled : !!fallback.hourlyEnabled,
+        hourlyMinute: clampInteger(raw.hourlyMinute, fallback.hourlyMinute, 0, 59),
+        dailyEnabled: raw.dailyEnabled !== undefined ? !!raw.dailyEnabled : !!fallback.dailyEnabled,
+        dailyHour: clampInteger(raw.dailyHour, fallback.dailyHour, 0, 23),
+        dailyMinute: clampInteger(raw.dailyMinute, fallback.dailyMinute, 0, 59),
+        retentionDays: clampInteger(raw.retentionDays, fallback.retentionDays, 0, 365),
+    };
+}
+
+function normalizeReportBaseline(rawBaseline) {
+    if (!rawBaseline || typeof rawBaseline !== 'object') return null;
+    const operations = {};
+    for (const key of REPORT_OPERATION_KEYS) {
+        operations[key] = Math.max(0, Number.parseInt(rawBaseline.operations && rawBaseline.operations[key], 10) || 0);
+    }
+    return {
+        sessionExpGained: Math.max(0, Number(rawBaseline.sessionExpGained) || 0),
+        sessionGoldGained: Math.max(0, Number(rawBaseline.sessionGoldGained) || 0),
+        sessionCouponGained: Math.max(0, Number(rawBaseline.sessionCouponGained) || 0),
+        operations,
+        recordedAt: Math.max(0, Number(rawBaseline.recordedAt) || 0),
+    };
+}
+
+function normalizeReportState(rawState, fallbackState = DEFAULT_REPORT_STATE) {
+    const raw = (rawState && typeof rawState === 'object') ? rawState : {};
+    const fallback = (fallbackState && typeof fallbackState === 'object') ? fallbackState : DEFAULT_REPORT_STATE;
+    return {
+        lastHourlySlot: String(raw.lastHourlySlot !== undefined ? raw.lastHourlySlot : fallback.lastHourlySlot || '').trim(),
+        lastDailySlot: String(raw.lastDailySlot !== undefined ? raw.lastDailySlot : fallback.lastDailySlot || '').trim(),
+        hourlyBaseline: normalizeReportBaseline(raw.hourlyBaseline !== undefined ? raw.hourlyBaseline : fallback.hourlyBaseline),
+        dailyBaseline: normalizeReportBaseline(raw.dailyBaseline !== undefined ? raw.dailyBaseline : fallback.dailyBaseline),
+    };
+}
+
 function normalizeWorkflowLane(rawLane, fallbackLane) {
     const raw = (rawLane && typeof rawLane === 'object') ? rawLane : {};
     const fallback = (fallbackLane && typeof fallbackLane === 'object') ? fallbackLane : { enabled: false, minInterval: 30, maxInterval: 120, nodes: [] };
@@ -174,13 +292,66 @@ function normalizeWorkflowConfig(rawWorkflow, fallbackWorkflow = DEFAULT_ACCOUNT
     };
 }
 
+function normalizeTradeConfig(rawTrade, fallbackTrade = DEFAULT_TRADE_CONFIG) {
+    const raw = (rawTrade && typeof rawTrade === 'object') ? rawTrade : {};
+    const fallback = (fallbackTrade && typeof fallbackTrade === 'object') ? fallbackTrade : DEFAULT_TRADE_CONFIG;
+    const rawSell = (raw.sell && typeof raw.sell === 'object') ? raw.sell : {};
+    const fallbackSell = (fallback.sell && typeof fallback.sell === 'object') ? fallback.sell : DEFAULT_TRADE_CONFIG.sell;
+    const rawRareKeep = (rawSell.rareKeep && typeof rawSell.rareKeep === 'object') ? rawSell.rareKeep : {};
+    const fallbackRareKeep = (fallbackSell.rareKeep && typeof fallbackSell.rareKeep === 'object')
+        ? fallbackSell.rareKeep
+        : DEFAULT_TRADE_CONFIG.sell.rareKeep;
+    const judgeBy = new Set(['plant_level', 'unit_price', 'either']).has(String(rawRareKeep.judgeBy || ''))
+        ? String(rawRareKeep.judgeBy)
+        : String(fallbackRareKeep.judgeBy || DEFAULT_TRADE_CONFIG.sell.rareKeep.judgeBy);
+
+    return {
+        sell: {
+            scope: 'fruit_only',
+            keepMinEachFruit: clampInteger(rawSell.keepMinEachFruit, fallbackSell.keepMinEachFruit, 0, 999999),
+            keepFruitIds: Array.isArray(rawSell.keepFruitIds)
+                ? rawSell.keepFruitIds.map(Number).filter(id => Number.isFinite(id) && id > 0)
+                : (Array.isArray(fallbackSell.keepFruitIds) ? fallbackSell.keepFruitIds.map(Number).filter(id => Number.isFinite(id) && id > 0) : []),
+            rareKeep: {
+                enabled: rawRareKeep.enabled !== undefined ? !!rawRareKeep.enabled : !!fallbackRareKeep.enabled,
+                judgeBy,
+                minPlantLevel: clampInteger(rawRareKeep.minPlantLevel, fallbackRareKeep.minPlantLevel, 0, 999),
+                minUnitPrice: clampInteger(rawRareKeep.minUnitPrice, fallbackRareKeep.minUnitPrice, 0, 999999999),
+            },
+            batchSize: clampInteger(rawSell.batchSize, fallbackSell.batchSize, 1, 50),
+            previewBeforeManualSell: rawSell.previewBeforeManualSell !== undefined
+                ? !!rawSell.previewBeforeManualSell
+                : !!fallbackSell.previewBeforeManualSell,
+        },
+    };
+}
+
+function normalizeAutomationValue(key, value, fallback) {
+    if (key === 'fertilizer') {
+        return FERTILIZER_OPTIONS.has(value) ? value : fallback;
+    }
+    if (key === 'fertilizer_buy_limit') {
+        const parsed = Number.parseInt(value, 10);
+        const next = Number.isFinite(parsed) ? parsed : Number.parseInt(fallback, 10);
+        return Math.max(1, Math.min(9999, Number.isFinite(next) ? next : 100));
+    }
+    if (key === 'landUpgradeTarget') {
+        const parsed = Number.parseInt(value, 10);
+        const next = Number.isFinite(parsed) ? parsed : Number.parseInt(fallback, 10);
+        return Math.max(0, Math.min(6, Number.isFinite(next) ? next : 6));
+    }
+    return !!value;
+}
+
 function cloneAccountConfig(base = DEFAULT_ACCOUNT_CONFIG) {
     const srcAutomation = (base && base.automation && typeof base.automation === 'object')
         ? base.automation
         : {};
     const automation = { ...DEFAULT_ACCOUNT_CONFIG.automation };
     for (const key of Object.keys(automation)) {
-        if (srcAutomation[key] !== undefined) automation[key] = srcAutomation[key];
+        if (srcAutomation[key] !== undefined) {
+            automation[key] = normalizeAutomationValue(key, srcAutomation[key], automation[key]);
+        }
     }
 
     const rawBlacklist = Array.isArray(base.friendBlacklist) ? base.friendBlacklist : [];
@@ -215,6 +386,9 @@ function cloneAccountConfig(base = DEFAULT_ACCOUNT_CONFIG) {
         skipStealRadish,
         forceGetAll,
         workflowConfig: normalizeWorkflowConfig(base.workflowConfig, DEFAULT_ACCOUNT_CONFIG.workflowConfig),
+        tradeConfig: normalizeTradeConfig(base.tradeConfig, DEFAULT_ACCOUNT_CONFIG.tradeConfig),
+        reportConfig: normalizeReportConfig(base.reportConfig, DEFAULT_ACCOUNT_CONFIG.reportConfig),
+        reportState: normalizeReportState(base.reportState, DEFAULT_ACCOUNT_CONFIG.reportState),
     };
 }
 
@@ -232,12 +406,7 @@ function normalizeAccountConfig(input, fallback = accountFallbackConfig) {
     if (src.automation && typeof src.automation === 'object') {
         for (const [k, v] of Object.entries(src.automation)) {
             if (!ALLOWED_AUTOMATION_KEYS.has(k)) continue;
-            if (k === 'fertilizer') {
-                const allowed = ['both', 'normal', 'organic', 'none'];
-                cfg.automation[k] = allowed.includes(v) ? v : cfg.automation[k];
-            } else {
-                cfg.automation[k] = !!v;
-            }
+            cfg.automation[k] = normalizeAutomationValue(k, v, cfg.automation[k]);
         }
     }
 
@@ -302,6 +471,24 @@ function normalizeAccountConfig(input, fallback = accountFallbackConfig) {
         cfg.workflowConfig = normalizeWorkflowConfig(src.workflowConfig, cfg.workflowConfig || DEFAULT_ACCOUNT_CONFIG.workflowConfig);
     } else {
         cfg.workflowConfig = normalizeWorkflowConfig(cfg.workflowConfig, DEFAULT_ACCOUNT_CONFIG.workflowConfig);
+    }
+
+    if (src.tradeConfig && typeof src.tradeConfig === 'object') {
+        cfg.tradeConfig = normalizeTradeConfig(src.tradeConfig, cfg.tradeConfig || DEFAULT_ACCOUNT_CONFIG.tradeConfig);
+    } else {
+        cfg.tradeConfig = normalizeTradeConfig(cfg.tradeConfig, DEFAULT_ACCOUNT_CONFIG.tradeConfig);
+    }
+
+    if (src.reportConfig && typeof src.reportConfig === 'object') {
+        cfg.reportConfig = normalizeReportConfig(src.reportConfig, cfg.reportConfig || DEFAULT_ACCOUNT_CONFIG.reportConfig);
+    } else {
+        cfg.reportConfig = normalizeReportConfig(cfg.reportConfig, DEFAULT_ACCOUNT_CONFIG.reportConfig);
+    }
+
+    if (src.reportState && typeof src.reportState === 'object') {
+        cfg.reportState = normalizeReportState(src.reportState, cfg.reportState || DEFAULT_ACCOUNT_CONFIG.reportState);
+    } else {
+        cfg.reportState = normalizeReportState(cfg.reportState, DEFAULT_ACCOUNT_CONFIG.reportState);
     }
 
     return cfg;
@@ -374,6 +561,9 @@ async function loadGlobalConfigFromDB() {
             if (r.advanced_settings) {
                 try { adv = JSON.parse(r.advanced_settings); } catch (err) { }
             }
+            if (adv.automation && typeof adv.automation === 'object') {
+                automation = { ...automation, ...adv.automation };
+            }
 
             globalConfig.accountConfigs[r.account_id] = normalizeAccountConfig({
                 automation,
@@ -388,6 +578,8 @@ async function loadGlobalConfigFromDB() {
                 skipStealRadish: adv.skipStealRadish,
                 forceGetAll: adv.forceGetAll,
                 workflowConfig: adv.workflowConfig,
+                reportConfig: adv.reportConfig,
+                reportState: adv.reportState,
             }, accountFallbackConfig);
 
             if (adv.ui) {
@@ -441,6 +633,7 @@ function saveGlobalConfigImmediate() {
         transaction(async (conn) => {
             for (const [id, cfg] of Object.entries(globalConfig.accountConfigs)) {
                 const advSetting = JSON.stringify({
+                    automation: cfg.automation || {},
                     intervals: cfg.intervals || {},
                     friendQuietHours: cfg.friendQuietHours || {},
                     friendBlacklist: cfg.friendBlacklist || [],
@@ -450,6 +643,8 @@ function saveGlobalConfigImmediate() {
                     skipStealRadish: cfg.skipStealRadish || { enabled: false },
                     forceGetAll: cfg.forceGetAll || { enabled: false },
                     workflowConfig: normalizeWorkflowConfig(cfg.workflowConfig, DEFAULT_ACCOUNT_CONFIG.workflowConfig),
+                    reportConfig: normalizeReportConfig(cfg.reportConfig, DEFAULT_ACCOUNT_CONFIG.reportConfig),
+                    reportState: normalizeReportState(cfg.reportState, DEFAULT_ACCOUNT_CONFIG.reportState),
                     ui: globalConfig.ui || {},
                     clusterConfig: globalConfig.clusterConfig || { dispatcherStrategy: 'round_robin' }
                 });
@@ -520,6 +715,8 @@ function getConfigSnapshot(accountId) {
         friendQuietHours: { ...cfg.friendQuietHours },
         friendBlacklist: [...(cfg.friendBlacklist || [])],
         workflowConfig: normalizeWorkflowConfig(cfg.workflowConfig, DEFAULT_ACCOUNT_CONFIG.workflowConfig),
+        tradeConfig: normalizeTradeConfig(cfg.tradeConfig, DEFAULT_ACCOUNT_CONFIG.tradeConfig),
+        reportConfig: normalizeReportConfig(cfg.reportConfig, DEFAULT_ACCOUNT_CONFIG.reportConfig),
         ui: { ...globalConfig.ui },
     };
 }
@@ -535,12 +732,7 @@ function applyConfigSnapshot(snapshot, options = {}) {
     if (cfg.automation && typeof cfg.automation === 'object') {
         for (const [k, v] of Object.entries(cfg.automation)) {
             if (next.automation[k] === undefined) continue;
-            if (k === 'fertilizer') {
-                const allowed = ['both', 'normal', 'organic', 'none'];
-                next.automation[k] = allowed.includes(v) ? v : next.automation[k];
-            } else {
-                next.automation[k] = !!v;
-            }
+            next.automation[k] = normalizeAutomationValue(k, v, next.automation[k]);
         }
     }
 
@@ -615,6 +807,18 @@ function applyConfigSnapshot(snapshot, options = {}) {
         next.workflowConfig = normalizeWorkflowConfig(cfg.workflowConfig, next.workflowConfig || DEFAULT_ACCOUNT_CONFIG.workflowConfig);
     }
 
+    if (cfg.tradeConfig && typeof cfg.tradeConfig === 'object') {
+        next.tradeConfig = normalizeTradeConfig(cfg.tradeConfig, next.tradeConfig || DEFAULT_ACCOUNT_CONFIG.tradeConfig);
+    }
+
+    if (cfg.reportConfig && typeof cfg.reportConfig === 'object') {
+        next.reportConfig = normalizeReportConfig(cfg.reportConfig, next.reportConfig || DEFAULT_ACCOUNT_CONFIG.reportConfig);
+    }
+
+    if (cfg.reportState && typeof cfg.reportState === 'object') {
+        next.reportState = normalizeReportState(cfg.reportState, next.reportState || DEFAULT_ACCOUNT_CONFIG.reportState);
+    }
+
     setAccountConfigSnapshot(accountId, next, false);
     if (persist) saveGlobalConfig();
     return getConfigSnapshot(accountId);
@@ -658,6 +862,14 @@ function normalizeIntervals(intervals) {
     let friendMax = toSec(src.friendMax, friend);
     if (friendMin > friendMax) [friendMin, friendMax] = [friendMax, friendMin];
 
+    let helpMin = toSec(src.helpMin, friendMin);
+    let helpMax = toSec(src.helpMax, friendMax);
+    if (helpMin > helpMax) [helpMin, helpMax] = [helpMax, helpMin];
+
+    let stealMin = toSec(src.stealMin, friendMin);
+    let stealMax = toSec(src.stealMax, friendMax);
+    if (stealMin > stealMax) [stealMin, stealMax] = [stealMax, stealMin];
+
     return {
         ...src,
         farm,
@@ -666,6 +878,10 @@ function normalizeIntervals(intervals) {
         farmMax,
         friendMin,
         friendMax,
+        helpMin,
+        helpMax,
+        stealMin,
+        stealMax,
     };
 }
 
@@ -680,6 +896,18 @@ function normalizeTimeString(v, fallback) {
 
 function getFriendQuietHours(accountId) {
     return { ...getAccountConfigSnapshot(accountId).friendQuietHours };
+}
+
+function getTradeConfig(accountId) {
+    return normalizeTradeConfig(getAccountConfigSnapshot(accountId).tradeConfig, DEFAULT_ACCOUNT_CONFIG.tradeConfig);
+}
+
+function setTradeConfig(accountId, cfg) {
+    const current = getAccountConfigSnapshot(accountId);
+    const next = normalizeAccountConfig(current, accountFallbackConfig);
+    next.tradeConfig = normalizeTradeConfig(cfg, next.tradeConfig || DEFAULT_ACCOUNT_CONFIG.tradeConfig);
+    setAccountConfigSnapshot(accountId, next);
+    return getTradeConfig(accountId);
 }
 
 function getFriendBlacklist(accountId) {
@@ -763,6 +991,30 @@ function setForceGetAllConfig(accountId, cfg) {
     next.forceGetAll = { enabled: !!(cfg && cfg.enabled) };
     setAccountConfigSnapshot(accountId, next);
     return getForceGetAllConfig(accountId);
+}
+
+function getReportConfig(accountId) {
+    return { ...(getAccountConfigSnapshot(accountId).reportConfig || DEFAULT_REPORT_CONFIG) };
+}
+
+function setReportConfig(accountId, cfg) {
+    const current = getAccountConfigSnapshot(accountId);
+    const next = normalizeAccountConfig(current, accountFallbackConfig);
+    next.reportConfig = normalizeReportConfig({ ...next.reportConfig, ...(cfg || {}) }, next.reportConfig || DEFAULT_REPORT_CONFIG);
+    setAccountConfigSnapshot(accountId, next);
+    return getReportConfig(accountId);
+}
+
+function getReportState(accountId) {
+    return normalizeReportState(getAccountConfigSnapshot(accountId).reportState, DEFAULT_REPORT_STATE);
+}
+
+function setReportState(accountId, state) {
+    const current = getAccountConfigSnapshot(accountId);
+    const next = normalizeAccountConfig(current, accountFallbackConfig);
+    next.reportState = normalizeReportState({ ...next.reportState, ...(state || {}) }, next.reportState || DEFAULT_REPORT_STATE);
+    setAccountConfigSnapshot(accountId, next);
+    return getReportState(accountId);
 }
 
 function getUI() {
@@ -1156,6 +1408,7 @@ module.exports = {
     loadAllFromDB,
     DEFAULT_ACCOUNT_CONFIG,
     DEFAULT_TIMING_CONFIG,
+    DEFAULT_TRADE_CONFIG,
     getAccountConfigSnapshot,
     setAccountConfigSnapshot,
     removeAccountConfig,
@@ -1168,6 +1421,8 @@ module.exports = {
     getPreferredSeed,
     getIntervals,
     getFriendQuietHours,
+    getTradeConfig,
+    setTradeConfig,
     getFriendBlacklist,
     setFriendBlacklist,
     getStealFilterConfig,
@@ -1180,6 +1435,10 @@ module.exports = {
     setSkipStealRadishConfig,
     getForceGetAllConfig,
     setForceGetAllConfig,
+    getReportConfig,
+    setReportConfig,
+    getReportState,
+    setReportState,
     getUI,
     setUITheme,
     getOfflineReminder,

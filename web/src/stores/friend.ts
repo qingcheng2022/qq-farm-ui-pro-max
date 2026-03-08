@@ -153,6 +153,20 @@ export const useFriendStore = defineStore('friend', () => {
     }
   }
 
+  async function batchOperate(accountId: string, friendIds: Array<string | number>, opType: string, options: Record<string, any> = {}) {
+    if (!accountId || !friendIds.length)
+      return null
+    const res = await api.post('/api/friends/batch-op', {
+      gids: friendIds.map(id => Number(id)).filter(id => Number.isFinite(id) && id > 0),
+      opType,
+      options,
+    }, {
+      headers: { 'x-account-id': accountId },
+    })
+    await fetchFriends(accountId)
+    return res.data?.data || null
+  }
+
   async function fetchCachedFriends(accountId: string) {
     if (!accountId)
       return
@@ -183,5 +197,6 @@ export const useFriendStore = defineStore('friend', () => {
     toggleBlacklist,
     fetchFriendLands,
     operate,
+    batchOperate,
   }
 })

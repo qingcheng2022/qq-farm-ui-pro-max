@@ -234,7 +234,11 @@ const AUTOMATION_SCHEMA = {
     friend_auto_accept: { type: 'boolean', default: false, label: '自动同意好友' },
     friend_three_phase: { type: 'boolean', default: false, label: '三阶段巡查模式' },
     auto_blacklist_banned: { type: 'boolean', default: true, label: '被封禁好友自动加黑' },
+    fertilizer_buy_limit: { type: 'integer', min: 1, max: 9999, default: 100, label: '单日化肥购买上限' },
     fertilizer_60s_anti_steal: { type: 'boolean', default: false, label: '60秒防偷' },
+    fertilizer_smart_phase: { type: 'boolean', default: false, label: '智能二季施肥' },
+    fastHarvest: { type: 'boolean', default: false, label: '秒收取' },
+    landUpgradeTarget: { type: 'integer', min: 0, max: 6, default: 6, label: '土地升级目标等级' },
     fertilizer: { type: 'string', enum: ['both', 'normal', 'organic', 'none'], default: 'none', label: '施肥策略' },
 };
 
@@ -245,6 +249,10 @@ const INTERVALS_SCHEMA = {
     farmMax: { type: 'integer', min: 1, max: 86400, default: 200, label: '农场最大间隔(秒)' },
     friendMin: { type: 'integer', min: 1, max: 86400, default: 100, label: '好友最小间隔(秒)' },
     friendMax: { type: 'integer', min: 1, max: 86400, default: 600, label: '好友最大间隔(秒)' },
+    helpMin: { type: 'integer', min: 1, max: 86400, default: 100, label: '帮忙最小间隔(秒)' },
+    helpMax: { type: 'integer', min: 1, max: 86400, default: 600, label: '帮忙最大间隔(秒)' },
+    stealMin: { type: 'integer', min: 1, max: 86400, default: 100, label: '偷菜最小间隔(秒)' },
+    stealMax: { type: 'integer', min: 1, max: 86400, default: 600, label: '偷菜最大间隔(秒)' },
 };
 
 const FRIEND_QUIET_HOURS_SCHEMA = {
@@ -288,6 +296,84 @@ const WORKFLOW_CONFIG_SCHEMA = {
         label: '好友工作流',
         properties: WORKFLOW_SCOPE_SCHEMA,
     },
+};
+
+const TRADE_CONFIG_SCHEMA = {
+    sell: {
+        type: 'object',
+        label: '出售配置',
+        properties: {
+            scope: {
+                type: 'string',
+                enum: ['fruit_only'],
+                default: 'fruit_only',
+                label: '出售范围',
+            },
+            keepMinEachFruit: {
+                type: 'integer',
+                min: 0,
+                max: 999999,
+                default: 0,
+                label: '每种果实最少保留数量',
+            },
+            keepFruitIds: {
+                type: 'array',
+                default: [],
+                label: '强制保留果实ID',
+            },
+            rareKeep: {
+                type: 'object',
+                label: '稀有保留',
+                properties: {
+                    enabled: { type: 'boolean', default: false, label: '稀有保留开关' },
+                    judgeBy: {
+                        type: 'string',
+                        enum: ['plant_level', 'unit_price', 'either'],
+                        default: 'either',
+                        label: '稀有判定方式',
+                    },
+                    minPlantLevel: { type: 'integer', min: 0, max: 999, default: 40, label: '最低作物等级' },
+                    minUnitPrice: { type: 'integer', min: 0, max: 999999999, default: 2000, label: '最低单价' },
+                },
+            },
+            batchSize: {
+                type: 'integer',
+                min: 1,
+                max: 50,
+                default: 15,
+                label: '出售批大小',
+            },
+            previewBeforeManualSell: {
+                type: 'boolean',
+                default: false,
+                label: '手动出售前先预览',
+            },
+        },
+    },
+};
+
+const REPORT_CONFIG_SCHEMA = {
+    enabled: { type: 'boolean', default: false, label: '经营汇报开关' },
+    channel: {
+        type: 'string',
+        enum: [
+            'webhook', 'qmsg', 'serverchan', 'pushplus', 'pushplushxtrip',
+            'dingtalk', 'wecom', 'bark', 'gocqhttp', 'onebot', 'atri',
+            'pushdeer', 'igot', 'telegram', 'feishu', 'ifttt', 'wecombot',
+            'discord', 'wxpusher',
+        ],
+        default: 'webhook',
+        label: '经营汇报渠道',
+    },
+    endpoint: { type: 'string', max: 1000, default: '', label: '经营汇报接口地址' },
+    token: { type: 'string', max: 1000, default: '', label: '经营汇报Token' },
+    title: { type: 'string', max: 100, default: '经营汇报', label: '经营汇报标题' },
+    hourlyEnabled: { type: 'boolean', default: false, label: '小时汇报' },
+    hourlyMinute: { type: 'integer', min: 0, max: 59, default: 5, label: '小时汇报分钟' },
+    dailyEnabled: { type: 'boolean', default: true, label: '日报开关' },
+    dailyHour: { type: 'integer', min: 0, max: 23, default: 21, label: '日报小时' },
+    dailyMinute: { type: 'integer', min: 0, max: 59, default: 0, label: '日报分钟' },
+    retentionDays: { type: 'integer', min: 0, max: 365, default: 30, label: '汇报历史保留天数' },
 };
 
 const SETTINGS_SCHEMA = {
@@ -338,6 +424,16 @@ const SETTINGS_SCHEMA = {
         label: '工作流编排',
         properties: WORKFLOW_CONFIG_SCHEMA,
     },
+    tradeConfig: {
+        type: 'object',
+        label: '交易配置',
+        properties: TRADE_CONFIG_SCHEMA,
+    },
+    reportConfig: {
+        type: 'object',
+        label: '经营汇报',
+        properties: REPORT_CONFIG_SCHEMA,
+    },
 };
 
 /**
@@ -373,6 +469,7 @@ module.exports = {
     SETTINGS_SCHEMA,
     AUTOMATION_SCHEMA,
     INTERVALS_SCHEMA,
+    TRADE_CONFIG_SCHEMA,
     STEAL_FRIEND_FILTER_SCHEMA,
     WORKFLOW_CONFIG_SCHEMA,
 };

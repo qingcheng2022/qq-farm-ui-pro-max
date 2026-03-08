@@ -30,6 +30,7 @@ module.exports = {
 
     // 操作指令入口
     doFriendOperation: actions.doFriendOperation,
+    doFriendBatchOperation: actions.doFriendBatchOperation,
 
     // 蹲守暴露
     getActiveStakeouts: scanner.getActiveStakeouts,

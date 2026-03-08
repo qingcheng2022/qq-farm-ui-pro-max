@@ -86,7 +86,13 @@ function createDataProvider(options) {
         getFriends: async (accountRef) => callWorkerApi(await resolveAccountRefId(accountRef), 'getFriends'),
         getFriendLands: async (accountRef, gid) => callWorkerApi(await resolveAccountRefId(accountRef), 'getFriendLands', gid),
         doFriendOp: async (accountRef, gid, opType) => callWorkerApi(await resolveAccountRefId(accountRef), 'doFriendOp', gid, opType),
+        doFriendBatchOp: async (accountRef, gids, opType, options) => callWorkerApi(await resolveAccountRefId(accountRef), 'doFriendBatchOp', gids, opType, options),
         getBag: async (accountRef) => callWorkerApi(await resolveAccountRefId(accountRef), 'getBag'),
+        getMallGoods: async (accountRef, slotType) => callWorkerApi(await resolveAccountRefId(accountRef), 'getMallGoods', slotType),
+        buyMallGoods: async (accountRef, goodsId, count) => callWorkerApi(await resolveAccountRefId(accountRef), 'buyMallGoods', goodsId, count),
+        getSellPreview: async (accountRef, tradeConfig) => callWorkerApi(await resolveAccountRefId(accountRef), 'getSellPreview', tradeConfig),
+        sellByPolicy: async (accountRef, tradeConfig, options) => callWorkerApi(await resolveAccountRefId(accountRef), 'sellByPolicy', tradeConfig, options),
+        sellSelected: async (accountRef, itemIds, options) => callWorkerApi(await resolveAccountRefId(accountRef), 'sellSelected', itemIds, options),
         getDailyGifts: async (accountRef) => callWorkerApi(await resolveAccountRefId(accountRef), 'getDailyGiftOverview'),
         getSeeds: async (accountRef) => callWorkerApi(await resolveAccountRefId(accountRef), 'getSeeds'),
 
@@ -159,6 +165,12 @@ function createDataProvider(options) {
             if (body.workflowConfig !== undefined) {
                 snapshot.workflowConfig = body.workflowConfig;
             }
+            if (body.tradeConfig !== undefined) {
+                snapshot.tradeConfig = body.tradeConfig;
+            }
+            if (body.reportConfig !== undefined) {
+                snapshot.reportConfig = body.reportConfig;
+            }
             store.applyConfigSnapshot(snapshot, { accountId });
             const rev = nextConfigRevision();
             broadcastConfigToWorkers(accountId);
@@ -169,6 +181,8 @@ function createDataProvider(options) {
                 preferredSeedId: store.getPreferredSeed(accountId),
                 intervals: store.getIntervals(accountId),
                 friendQuietHours: store.getFriendQuietHours(accountId),
+                tradeConfig: store.getTradeConfig ? store.getTradeConfig(accountId) : {},
+                reportConfig: store.getReportConfig ? store.getReportConfig(accountId) : {},
                 configRevision: rev,
             };
         },

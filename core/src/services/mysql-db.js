@@ -236,6 +236,14 @@ async function initMysql() {
                 `);
                 logger.info('✅ stats_daily 收益表创建完成');
             }
+
+            const [reportLogsTable] = await pool.execute(`SHOW TABLES LIKE 'report_logs'`);
+            if (reportLogsTable.length === 0) {
+                await runMigrationFile(
+                    path.join(migrationsDir, '011-report-logs.sql'),
+                    '检测到缺少 report_logs 表，正在执行迁移 011-report-logs.sql',
+                );
+            }
         }
 
         const connection = await pool.getConnection();

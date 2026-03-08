@@ -27,6 +27,9 @@ const farmScheduler = createScheduler('farm');
 let landsFetchPromise = null;
 let landsFetchTime = 0;
 const LANDS_CACHE_TTL_MS = 500;
+const FAST_HARVEST_WINDOW_SEC = 60;
+const FAST_HARVEST_ADVANCE_MS = 200;
+const FAST_HARVEST_TASK_PREFIX = 'fast_harvest_land_';
 
 // ============ 访客行为检测 (来源: NC 版 farm.js#L32-92) ============
 // visitorCache: 缓存每块地的访客状态，用于 diff 检测新增访客（种草/放虫/偷菜）
@@ -394,6 +397,79 @@ async function harvestUrgent(landIds) {
     })).finish();
     const { body: replyBody } = await sendMsgAsyncUrgent('gamepb.plantpb.PlantService', 'Harvest', body);
     return types.HarvestReply.decode(replyBody);
+}
+
+function getFastHarvestTaskId(landId) {
+    return `${FAST_HARVEST_TASK_PREFIX}${toNum(landId)}`;
+}
+
+function getLandUpgradeTarget() {
+    const raw = Number.parseInt(getAutomation().landUpgradeTarget, 10);
+    return Math.max(0, Math.min(6, Number.isFinite(raw) ? raw : 6));
+}
+
+async function executeFastHarvest(item) {
+    const landId = toNum(item && item.landId);
+    const plantLabel = item && item.plantName ? item.plantName : `土地#${landId}`;
+    if (landId <= 0) return;
+
+    try {
+        const reply = await harvestUrgent([landId]);
+        const harvested = Array.isArray(reply && reply.items) ? reply.items.length > 0 : true;
+        if (harvested) {
+            recordOperation('harvest', 1);
+            log('秒收', `${plantLabel} 已在成熟瞬间收获`, {
+                module: 'farm',
+                event: 'fast_harvest',
+                result: 'ok',
+                landId,
+            });
+            networkEvents.emit('farmHarvested', {
+                count: 1,
+                landIds: [landId],
+                opType: 'fast_harvest',
+            });
+            networkEvents.emit('farmStateChanged', {});
+            return;
+        }
+        logWarn('秒收', `${plantLabel} 定时收获未返回有效掉落，可能已被提前处理`);
+    } catch (error) {
+        logWarn('秒收', `${plantLabel} 定时收获失败: ${error.message}`);
+    }
+}
+
+function syncFastHarvestTasks(soonToMature) {
+    const desired = new Map();
+    for (const item of Array.isArray(soonToMature) ? soonToMature : []) {
+        const landId = toNum(item && item.landId);
+        if (landId > 0) desired.set(landId, item);
+    }
+
+    for (const taskName of farmScheduler.getTaskNames()) {
+        if (!taskName.startsWith(FAST_HARVEST_TASK_PREFIX)) continue;
+        const landId = Number.parseInt(taskName.slice(FAST_HARVEST_TASK_PREFIX.length), 10);
+        if (!desired.has(landId)) {
+            farmScheduler.clear(taskName);
+        }
+    }
+
+    if (!getAutomation().fastHarvest) return;
+
+    for (const item of desired.values()) {
+        const taskId = getFastHarvestTaskId(item.landId);
+        if (farmScheduler.has(taskId)) continue;
+
+        const waitMs = Math.max(0, ((item.matureTime - getServerTimeSec()) * 1000) - FAST_HARVEST_ADVANCE_MS);
+        farmScheduler.setTimeoutTask(taskId, waitMs, async () => {
+            await executeFastHarvest(item);
+        });
+        log('秒收', `已为地块#${item.landId} 预设秒收任务 (约 ${Math.max(0, item.matureTime - getServerTimeSec())}s 后)`, {
+            module: 'farm',
+            event: 'fast_harvest_schedule',
+            landId: toNum(item.landId),
+            waitMs,
+        });
+    }
 }
 
 /**
@@ -999,6 +1075,7 @@ function analyzeLands(lands) {
         harvestable: [], needWater: [], needWeed: [], needBug: [],
         growing: [], empty: [], dead: [], unlockable: [], upgradable: [],
         harvestableInfo: [],
+        soonToMature: [],
     };
 
     const nowSec = getServerTimeSec();
@@ -1009,6 +1086,9 @@ function analyzeLands(lands) {
     const isSuspended = state.suspendUntil && Date.now() < state.suspendUntil;
     const fullCfg = getConfigSnapshot() || {};
     const accountMode = fullCfg.accountMode || 'main';
+    const autoCfg = getAutomation() || {};
+    const fastHarvestEnabled = !!autoCfg.fastHarvest;
+    const landUpgradeTarget = getLandUpgradeTarget();
 
     for (const land of lands) {
         const id = toNum(land.id);
@@ -1019,7 +1099,10 @@ function analyzeLands(lands) {
             continue;
         }
         if (land.could_upgrade) {
-            result.upgradable.push(id);
+            const currentLevel = toNum(land.level || 0);
+            if (currentLevel < landUpgradeTarget) {
+                result.upgradable.push(id);
+            }
         }
 
         const plant = land.plant;
@@ -1109,6 +1192,23 @@ function analyzeLands(lands) {
             result.needBug.push(id);
         }
 
+        if (fastHarvestEnabled) {
+            const plantId = toNum(plant.id);
+            const maturePhase = Array.isArray(plant.phases)
+                ? plant.phases.find((p) => p && toNum(p.phase) === PlantPhase.MATURE)
+                : null;
+            const matureBegin = maturePhase ? toTimeSec(maturePhase.begin_time) : 0;
+            const matureInSec = matureBegin > nowSec ? (matureBegin - nowSec) : 0;
+            if (matureInSec > 0 && matureInSec <= FAST_HARVEST_WINDOW_SEC) {
+                result.soonToMature.push({
+                    landId: id,
+                    matureTime: matureBegin,
+                    plantId,
+                    plantName: getPlantName(plantId) || plant.name || `土地#${id}`,
+                });
+            }
+        }
+
         result.growing.push(id);
 
         // 防偷60秒注册逻辑（🔧 优化：state / isSuspended 已在循环外预计算）
@@ -1126,7 +1226,7 @@ function analyzeLands(lands) {
                 const targetWaitSec = Math.max(0, matureInSec - 60);
                 const timerId = `anti_steal_land_${id}`;
                 // 使用 farmScheduler 预埋
-                if (!farmScheduler.hasTask(timerId)) {
+                if (!farmScheduler.has(timerId)) {
                     log('防偷', `土地#${id} 将在 ${targetWaitSec} 秒后 (剩余60秒时) 触发防偷抢收`);
                     farmScheduler.setTimeoutTask(timerId, targetWaitSec * 1000, async () => {
                         await antiStealHarvest(id);
@@ -1227,6 +1327,7 @@ async function runFarmOperation(opType) {
     try { await detectAndLogVisitorChanges(lands); } catch { /* 访客检测失败不阻塞主流程 */ }
 
     const status = analyzeLands(lands);
+    syncFastHarvestTasks(status.soonToMature);
 
     // 摘要
     const statusParts = [];

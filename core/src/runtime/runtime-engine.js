@@ -10,6 +10,7 @@ const { createReloginReminderService } = require('./relogin-reminder')
 const { createRuntimeState } = require('./runtime-state')
 const { createWorkerManager } = require('./worker-manager')
 const { updateFriendsCache } = require('../services/database')
+const { createReportService } = require('../services/report-service')
 
 const OPERATION_KEYS = ['harvest', 'water', 'weed', 'bug', 'fertilize', 'plant', 'steal', 'helpWater', 'helpWeed', 'helpBug', 'taskClaim', 'sell', 'upgrade']
 
@@ -109,6 +110,26 @@ function createRuntimeEngine(options = {}) {
     restartWorker,
   })
 
+  const reportService = createReportService({
+    store,
+    dataProvider,
+    getAccounts: getAccountsForProvider,
+    sendPushooMessage,
+    log,
+    addAccountLog,
+  })
+
+  dataProvider.sendAccountReportTest = async (accountRef) => {
+    return await reportService.sendTestReport(accountRef)
+  }
+  dataProvider.sendAccountReport = async (accountRef, mode) => {
+    if (mode === 'hourly')
+      return await reportService.sendHourlyReport(accountRef)
+    if (mode === 'daily')
+      return await reportService.sendDailyReport(accountRef)
+    throw new Error('Unsupported report mode')
+  }
+
   runtimeEvents.on('log', (entry) => {
     if (onLog) onLog(entry, entry && entry.accountId ? entry.accountId : '', entry && entry.accountName ? entry.accountName : '')
   })
@@ -172,6 +193,7 @@ function createRuntimeEngine(options = {}) {
 
     if (shouldStartAdminServer && startAdminServer) {
       startAdminServer(dataProvider)
+      reportService.start()
     }
 
     if (shouldAutoStartAccounts) {
@@ -194,6 +216,7 @@ function createRuntimeEngine(options = {}) {
     startAllAccounts,
     stopAllAccounts,
     broadcastConfigToWorkers,
+    reportService,
     startWorker,
     stopWorker,
     restartWorker,

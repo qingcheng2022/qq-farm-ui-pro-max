@@ -87,6 +87,45 @@ function parseMallPriceValue(priceField) {
     return Math.max(0, Math.floor(parsed || 0));
 }
 
+function parseMallIntList(bytesField) {
+    const bytes = Buffer.isBuffer(bytesField) ? bytesField : Buffer.from(bytesField || []);
+    if (!bytes.length) return [];
+    const values = [];
+    let idx = 0;
+    while (idx < bytes.length) {
+        let value = 0;
+        let shift = 0;
+        while (idx < bytes.length) {
+            const b = bytes[idx++];
+            value |= (b & 0x7F) << shift;
+            if ((b & 0x80) === 0) break;
+            shift += 7;
+        }
+        if (value > 0) values.push(value);
+    }
+    return values;
+}
+
+function normalizeMallGoods(goods, slotType = 1) {
+    const row = goods || {};
+    return {
+        goodsId: toNum(row.goods_id),
+        name: String(row.name || `商品#${toNum(row.goods_id)}`),
+        type: toNum(row.type),
+        slotType: Number(slotType) || 1,
+        isFree: row.is_free === true,
+        isLimited: row.is_limited === true,
+        discount: String(row.discount || ''),
+        priceValue: parseMallPriceValue(row.price),
+        itemIds: parseMallIntList(row.item_ids),
+    };
+}
+
+async function getMallGoodsCatalog(slotType = 1) {
+    const goods = await getMallGoodsList(slotType);
+    return goods.map(item => normalizeMallGoods(item, slotType));
+}
+
 function findOrganicFertilizerMallGoods(goodsList) {
     const list = Array.isArray(goodsList) ? goodsList : [];
     return list.find((g) => toNum(g && g.goods_id) === ORGANIC_FERTILIZER_MALL_GOODS_ID) || null;
@@ -261,6 +300,10 @@ async function buyFreeGifts(force = false) {
 }
 
 module.exports = {
+    getMallListBySlotType,
+    getMallGoodsList,
+    getMallGoodsCatalog,
+    purchaseMallGoods,
     autoBuyOrganicFertilizer,
     buyFreeGifts,
     getFertilizerBuyDailyState: () => ({

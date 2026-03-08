@@ -23,6 +23,10 @@ const confirmMessage = ref('')
 const confirmLoading = ref(false)
 const pendingAction = ref<(() => Promise<void>) | null>(null)
 const avatarErrorKeys = ref<Set<string>>(new Set())
+const selectionMode = ref(false)
+const selectedFriendIds = ref<number[]>([])
+const batchRunning = ref(false)
+const batchResult = ref<any | null>(null)
 
 function confirmAction(msg: string, action: () => Promise<void>) {
   confirmMessage.value = msg
@@ -88,6 +92,8 @@ onMounted(() => {
 // 【修复闪烁】监听 accountId 字符串值而非 currentAccount 对象引用
 watch(() => currentAccountId.value, () => {
   expandedFriends.value.clear()
+  selectedFriendIds.value = []
+  batchResult.value = null
   loadFriends()
 })
 
@@ -104,6 +110,9 @@ const filteredFriends = computed(() => {
   })
 })
 
+const selectedFriendCount = computed(() => selectedFriendIds.value.length)
+const selectedIdSet = computed(() => new Set(selectedFriendIds.value))
+
 function toggleFriend(friendId: string) {
   if (expandedFriends.value.has(friendId)) {
     expandedFriends.value.delete(friendId)
@@ -118,6 +127,34 @@ function toggleFriend(friendId: string) {
       friendStore.fetchFriendLands(currentAccountId.value, friendId)
     }
   }
+}
+
+function toggleSelectionMode() {
+  selectionMode.value = !selectionMode.value
+  if (!selectionMode.value) {
+    selectedFriendIds.value = []
+  }
+}
+
+function toggleFriendSelection(friendId: string | number, e?: Event) {
+  e?.stopPropagation()
+  const gid = Number(friendId || 0)
+  if (!gid)
+    return
+  if (selectedIdSet.value.has(gid)) {
+    selectedFriendIds.value = selectedFriendIds.value.filter(id => id !== gid)
+  }
+  else {
+    selectedFriendIds.value = [...selectedFriendIds.value, gid]
+  }
+}
+
+function selectAllFiltered() {
+  selectedFriendIds.value = filteredFriends.value.map((friend: any) => Number(friend.gid || 0)).filter((gid: number) => gid > 0)
+}
+
+function clearSelectedFriends() {
+  selectedFriendIds.value = []
 }
 
 async function handleOp(friendId: string, type: string, e: Event) {
@@ -137,6 +174,44 @@ async function handleToggleBlacklist(friend: any, e: Event) {
     return
   await friendStore.toggleBlacklist(currentAccountId.value, Number(friend.gid))
   await loadFriends() // 切换黑名单后局部刷新
+}
+
+async function handleBatchOp(opType: string) {
+  if (!currentAccountId.value || selectedFriendIds.value.length === 0)
+    return
+  const actionLabels: Record<string, string> = {
+    steal: '批量偷菜',
+    water: '批量浇水',
+    weed: '批量除草',
+    bug: '批量除虫',
+    bad: '批量捣乱',
+    blacklist_add: '批量加入黑名单',
+    blacklist_remove: '批量移出黑名单',
+  }
+  confirmAction(`确定对已选 ${selectedFriendIds.value.length} 位好友执行“${actionLabels[opType] || opType}”吗？`, async () => {
+    batchRunning.value = true
+    try {
+      const result = await friendStore.batchOperate(currentAccountId.value!, selectedFriendIds.value, opType, {
+        continueOnError: true,
+        skipBlacklisted: opType !== 'blacklist_remove',
+        cooldownMs: 1200,
+      })
+      batchResult.value = result
+      if (result?.successCount > 0) {
+        toast.success(`${actionLabels[opType] || '批量操作'}完成，成功 ${result.successCount} 项`)
+      }
+      else {
+        toast.warning(`${actionLabels[opType] || '批量操作'}已执行，但没有成功项`)
+      }
+      if (opType === 'blacklist_add' || opType === 'blacklist_remove') {
+        await friendStore.fetchBlacklist(currentAccountId.value!)
+      }
+      await loadFriends()
+    }
+    finally {
+      batchRunning.value = false
+    }
+  })
 }
 
 function getFriendStatusText(friend: any) {

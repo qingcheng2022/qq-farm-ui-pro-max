@@ -9,9 +9,9 @@ const { getAutomation, getPreferredSeed, getConfigSnapshot, applyConfigSnapshot 
 const { checkAndClaimEmails } = require('../services/email');
 const { getEmailDailyState } = require('../services/email');
 const { checkFarm, startFarmCheckLoop, stopFarmCheckLoop, refreshFarmCheckLoop, getLandsDetail, getAvailableSeeds, runFarmOperation } = require('../services/farm');
-const { checkFriends, startFriendCheckLoop, stopFriendCheckLoop, refreshFriendCheckLoop, getFriendsList, getFriendLandsDetail, doFriendOperation } = require('../services/friend');
+const { checkFriends, startFriendCheckLoop, stopFriendCheckLoop, refreshFriendCheckLoop, getFriendsList, getFriendLandsDetail, doFriendOperation, doFriendBatchOperation } = require('../services/friend');
 const { processInviteCodes } = require('../services/invite');
-const { autoBuyOrganicFertilizer, buyFreeGifts, getFreeGiftDailyState } = require('../services/mall');
+const { autoBuyOrganicFertilizer, buyFreeGifts, getFreeGiftDailyState, getMallGoodsCatalog, purchaseMallGoods } = require('../services/mall');
 const { performDailyMonthCardGift, getMonthCardDailyState } = require('../services/monthcard');
 const { performDailyOpenServerGift, getOpenServerDailyState } = require('../services/openserver');
 const { performDailyVipGift, getVipDailyState } = require('../services/qqvip');
@@ -21,7 +21,7 @@ const { setInitialValues, resetSessionGains, recordOperation } = require('../ser
 const { initStatusBar, setStatusPlatform, statusData } = require('../services/status');
 const { setRecordGoldExpHook } = require('../services/status');
 const { cleanupTaskSystem, checkAndClaimTasks, getTaskClaimDailyState, getTaskDailyStateLikeApp, getGrowthTaskStateLikeApp } = require('../services/task');
-const { sellAllFruits, getBag, getBagItems, openFertilizerGiftPacksSilently } = require('../services/warehouse');
+const { sellAllFruits, getBag, getBagItems, getSellPreview, sellByPolicy, sellSelectedItems, openFertilizerGiftPacksSilently } = require('../services/warehouse');
 const { connect, cleanup, getWs, getUserState, networkEvents } = require('../utils/network');
 const { loadProto } = require('../utils/proto');
 const { setLogHook, log, toNum } = require('../utils/utils');
@@ -103,9 +103,11 @@ let loginReady = false;
 let appliedConfigRevision = 0;
 let unifiedSchedulerRunning = false;
 let farmTaskRunning = false;
-let friendTaskRunning = false;
+let helpTaskRunning = false;
+let stealTaskRunning = false;
 let nextFarmRunAt = 0;
-let nextFriendRunAt = 0;
+let nextHelpRunAt = 0;
+let nextStealRunAt = 0;
 let lastStatusHash = '';
 let lastStatusSentAt = 0;
 let onSellGain = null;
@@ -184,6 +186,16 @@ function applyIntervalsToRuntime(intervals) {
     CONFIG.friendCheckIntervalMin = friendRange.min * 1000;
     CONFIG.friendCheckIntervalMax = friendRange.max * 1000;
     CONFIG.friendCheckInterval = CONFIG.friendCheckIntervalMin;
+
+    const helpRange = normalizeIntervalRangeSec(data.helpMin, data.helpMax, friendRange.min);
+    CONFIG.helpCheckIntervalMin = helpRange.min * 1000;
+    CONFIG.helpCheckIntervalMax = helpRange.max * 1000;
+    CONFIG.helpCheckInterval = CONFIG.helpCheckIntervalMin;
+
+    const stealRange = normalizeIntervalRangeSec(data.stealMin, data.stealMax, friendRange.min);
+    CONFIG.stealCheckIntervalMin = stealRange.min * 1000;
+    CONFIG.stealCheckIntervalMax = stealRange.max * 1000;
+    CONFIG.stealCheckInterval = CONFIG.stealCheckIntervalMin;
 }
 
 function randomIntervalMs(minMs, maxMs) {
@@ -199,13 +211,18 @@ function resetUnifiedSchedule() {
         CONFIG.farmCheckIntervalMin || CONFIG.farmCheckInterval || 2000,
         CONFIG.farmCheckIntervalMax || CONFIG.farmCheckInterval || 2000
     );
-    const friendMs = randomIntervalMs(
-        CONFIG.friendCheckIntervalMin || CONFIG.friendCheckInterval || 10000,
-        CONFIG.friendCheckIntervalMax || CONFIG.friendCheckInterval || 10000
+    const helpMs = randomIntervalMs(
+        CONFIG.helpCheckIntervalMin || CONFIG.friendCheckIntervalMin || CONFIG.friendCheckInterval || 10000,
+        CONFIG.helpCheckIntervalMax || CONFIG.friendCheckIntervalMax || CONFIG.friendCheckInterval || 10000
+    );
+    const stealMs = randomIntervalMs(
+        CONFIG.stealCheckIntervalMin || CONFIG.friendCheckIntervalMin || CONFIG.friendCheckInterval || 10000,
+        CONFIG.stealCheckIntervalMax || CONFIG.friendCheckIntervalMax || CONFIG.friendCheckInterval || 10000
     );
     const now = Date.now();
     nextFarmRunAt = now + farmMs;
-    nextFriendRunAt = now + friendMs;
+    nextHelpRunAt = now + helpMs;
+    nextStealRunAt = now + stealMs;
 }
 
 async function runFarmTick(auto) {
@@ -229,20 +246,37 @@ async function runFarmTick(auto) {
     }
 }
 
-async function runFriendTick(auto) {
-    if (friendTaskRunning) return;
-    friendTaskRunning = true;
-    const friendMs = randomIntervalMs(
-        CONFIG.friendCheckIntervalMin || CONFIG.friendCheckInterval || 10000,
-        CONFIG.friendCheckIntervalMax || CONFIG.friendCheckInterval || 10000
+async function runHelpTick(auto) {
+    if (helpTaskRunning) return;
+    helpTaskRunning = true;
+    const helpMs = randomIntervalMs(
+        CONFIG.helpCheckIntervalMin || CONFIG.friendCheckIntervalMin || CONFIG.friendCheckInterval || 10000,
+        CONFIG.helpCheckIntervalMax || CONFIG.friendCheckIntervalMax || CONFIG.friendCheckInterval || 10000
     );
     try {
-        if (auto.friend_steal || auto.friend_help || auto.friend_bad) await checkFriends();
+        if (auto.friend_help || auto.friend_bad) await checkFriends('help');
     } catch (e) {
-        log('系统', `好友调度执行失败: ${e.message}`, { module: 'system', event: 'friend_tick', result: 'error' });
+        log('系统', `帮忙调度执行失败: ${e.message}`, { module: 'system', event: 'help_tick', result: 'error' });
     } finally {
-        nextFriendRunAt = Date.now() + friendMs;
-        friendTaskRunning = false;
+        nextHelpRunAt = Date.now() + helpMs;
+        helpTaskRunning = false;
+    }
+}
+
+async function runStealTick(auto) {
+    if (stealTaskRunning) return;
+    stealTaskRunning = true;
+    const stealMs = randomIntervalMs(
+        CONFIG.stealCheckIntervalMin || CONFIG.friendCheckIntervalMin || CONFIG.friendCheckInterval || 10000,
+        CONFIG.stealCheckIntervalMax || CONFIG.friendCheckIntervalMax || CONFIG.friendCheckInterval || 10000
+    );
+    try {
+        if (auto.friend_steal) await checkFriends('steal');
+    } catch (e) {
+        log('系统', `偷菜调度执行失败: ${e.message}`, { module: 'system', event: 'steal_tick', result: 'error' });
+    } finally {
+        nextStealRunAt = Date.now() + stealMs;
+        stealTaskRunning = false;
     }
 }
 
@@ -250,14 +284,14 @@ async function runUnifiedTick() {
     if (!unifiedSchedulerRunning || !loginReady) return;
     const now = Date.now();
     const dueFarm = now >= nextFarmRunAt;
-    const dueFriend = now >= nextFriendRunAt;
-    if (!dueFarm && !dueFriend) return;
+    const dueHelp = now >= nextHelpRunAt;
+    const dueSteal = now >= nextStealRunAt;
+    if (!dueFarm && !dueHelp && !dueSteal) return;
 
     const auto = getAutomation();
-    const tasks = [];
-    if (dueFarm) tasks.push(runFarmTick(auto));
-    if (dueFriend) tasks.push(runFriendTick(auto));
-    await Promise.all(tasks);
+    if (dueFarm) await runFarmTick(auto);
+    if (dueHelp) await runHelpTick(auto);
+    if (dueSteal) await runStealTick(auto);
 }
 
 function scheduleUnifiedNextTick() {
@@ -268,7 +302,8 @@ function scheduleUnifiedNextTick() {
     const now = Date.now();
     const nextAt = Math.min(
         Number(nextFarmRunAt) || (now + 1000),
-        Number(nextFriendRunAt) || (now + 1000)
+        Number(nextHelpRunAt) || (now + 1000),
+        Number(nextStealRunAt) || (now + 1000)
     );
     const delayMs = Math.max(1000, nextAt - now); // 最低 1 秒
 
@@ -291,7 +326,8 @@ function startUnifiedScheduler() {
 function stopUnifiedScheduler() {
     unifiedSchedulerRunning = false;
     farmTaskRunning = false;
-    friendTaskRunning = false;
+    helpTaskRunning = false;
+    stealTaskRunning = false;
     workerScheduler.clear('unified_next_tick');
 }
 
@@ -373,6 +409,12 @@ async function startBot(config) {
         CONFIG.friendCheckInterval = config.friendInterval;
         CONFIG.friendCheckIntervalMin = config.friendInterval;
         CONFIG.friendCheckIntervalMax = config.friendInterval;
+        CONFIG.helpCheckInterval = config.friendInterval;
+        CONFIG.helpCheckIntervalMin = config.friendInterval;
+        CONFIG.helpCheckIntervalMax = config.friendInterval;
+        CONFIG.stealCheckInterval = config.friendInterval;
+        CONFIG.stealCheckIntervalMin = config.friendInterval;
+        CONFIG.stealCheckIntervalMax = config.friendInterval;
     }
 
     await loadProto();
@@ -566,11 +608,29 @@ async function handleApiCall(msg) {
             case 'doFriendOp':
                 result = await doFriendOperation(args[0], args[1]);
                 break;
+            case 'doFriendBatchOp':
+                result = await doFriendBatchOperation(args[0], args[1], args[2] || {});
+                break;
             case 'getSeeds':
                 result = await getAvailableSeeds();
                 break;
             case 'getBag':
                 result = await require('../services/warehouse').getBagDetail();
+                break;
+            case 'getMallGoods':
+                result = await getMallGoodsCatalog(args[0]);
+                break;
+            case 'buyMallGoods':
+                result = await purchaseMallGoods(args[0], args[1]);
+                break;
+            case 'getSellPreview':
+                result = await getSellPreview(args[0]);
+                break;
+            case 'sellByPolicy':
+                result = await sellByPolicy(args[0], args[1] || { manual: true });
+                break;
+            case 'sellSelected':
+                result = await sellSelectedItems(args[0], args[1] || {});
                 break;
             case 'setAutomation': {
                 const payload = args && args[0] ? args[0] : {};
@@ -691,9 +751,13 @@ function syncStatus() {
     const limits = require('../services/friend').getOperationLimits();
     const fullStats = require('../services/stats').getStats(statusData, userState, connected, limits);
     const nowMs = Date.now();
+    const helpRemainSec = Math.max(0, Math.ceil((Number(nextHelpRunAt || 0) - nowMs) / 1000));
+    const stealRemainSec = Math.max(0, Math.ceil((Number(nextStealRunAt || 0) - nowMs) / 1000));
     fullStats.nextChecks = {
         farmRemainSec: Math.max(0, Math.ceil((Number(nextFarmRunAt || 0) - nowMs) / 1000)),
-        friendRemainSec: Math.max(0, Math.ceil((Number(nextFriendRunAt || 0) - nowMs) / 1000)),
+        friendRemainSec: Math.min(helpRemainSec || 0, stealRemainSec || 0),
+        helpRemainSec,
+        stealRemainSec,
     };
 
     fullStats.automation = getAutomation();

@@ -6,15 +6,20 @@ export interface AutomationConfig {
   farm?: boolean
   farm_push?: boolean
   land_upgrade?: boolean
+  landUpgradeTarget?: number
   friend?: boolean
   task?: boolean
   sell?: boolean
   fertilizer?: string
   fertilizer_buy?: boolean
   fertilizer_buy_limit?: number
+  fertilizer_60s_anti_steal?: boolean
+  fertilizer_smart_phase?: boolean
+  fastHarvest?: boolean
   friend_steal?: boolean
   friend_help?: boolean
   friend_bad?: boolean
+  friend_auto_accept?: boolean
   open_server_gift?: boolean
 }
 
@@ -25,12 +30,36 @@ export interface IntervalsConfig {
   farmMax?: number
   friendMin?: number
   friendMax?: number
+  helpMin?: number
+  helpMax?: number
+  stealMin?: number
+  stealMax?: number
 }
 
 export interface FriendQuietHoursConfig {
   enabled?: boolean
   start?: string
   end?: string
+}
+
+export interface TradeSellRareKeepConfig {
+  enabled?: boolean
+  judgeBy?: 'plant_level' | 'unit_price' | 'either'
+  minPlantLevel?: number
+  minUnitPrice?: number
+}
+
+export interface TradeSellConfig {
+  scope?: 'fruit_only'
+  keepMinEachFruit?: number
+  keepFruitIds?: number[]
+  rareKeep?: TradeSellRareKeepConfig
+  batchSize?: number
+  previewBeforeManualSell?: boolean
+}
+
+export interface TradeConfig {
+  sell?: TradeSellConfig
 }
 
 export interface OfflineConfig {
@@ -41,6 +70,40 @@ export interface OfflineConfig {
   title: string
   msg: string
   offlineDeleteSec: number
+}
+
+export interface ReportConfig {
+  enabled: boolean
+  channel: string
+  endpoint: string
+  token: string
+  title: string
+  hourlyEnabled: boolean
+  hourlyMinute: number
+  dailyEnabled: boolean
+  dailyHour: number
+  dailyMinute: number
+  retentionDays: number
+}
+
+export interface ReportLogEntry {
+  id: number
+  accountId: string
+  accountName: string
+  mode: 'test' | 'hourly' | 'daily' | string
+  ok: boolean
+  channel: string
+  title: string
+  content: string
+  errorMessage: string
+  createdAt: string
+}
+
+export interface ReportLogPagination {
+  page: number
+  pageSize: number
+  total: number
+  totalPages: number
 }
 
 export interface TrialCardConfig {
@@ -107,7 +170,9 @@ export interface SettingsState {
   preferredSeedId: number
   intervals: IntervalsConfig
   friendQuietHours: FriendQuietHoursConfig
+  tradeConfig: TradeConfig
   automation: AutomationConfig
+  reportConfig: ReportConfig
   ui: UIConfig
   offlineReminder: OfflineConfig
   trialConfig: TrialCardConfig
@@ -125,7 +190,35 @@ export const useSettingStore = defineStore('setting', () => {
     preferredSeedId: 0,
     intervals: {},
     friendQuietHours: { enabled: false, start: '23:00', end: '07:00' },
+    tradeConfig: {
+      sell: {
+        scope: 'fruit_only',
+        keepMinEachFruit: 0,
+        keepFruitIds: [],
+        rareKeep: {
+          enabled: false,
+          judgeBy: 'either',
+          minPlantLevel: 40,
+          minUnitPrice: 2000,
+        },
+        batchSize: 15,
+        previewBeforeManualSell: false,
+      },
+    },
     automation: {},
+    reportConfig: {
+      enabled: false,
+      channel: 'webhook',
+      endpoint: '',
+      token: '',
+      title: '经营汇报',
+      hourlyEnabled: false,
+      hourlyMinute: 5,
+      dailyEnabled: true,
+      dailyHour: 21,
+      dailyMinute: 0,
+      retentionDays: 30,
+    },
     ui: {},
     offlineReminder: {
       channel: 'webhook',
@@ -179,6 +272,13 @@ export const useSettingStore = defineStore('setting', () => {
   })
   const loading = ref(false)
   const timingLoading = ref(false)
+  const reportLogs = ref<ReportLogEntry[]>([])
+  const reportLogPagination = ref<ReportLogPagination>({
+    page: 1,
+    pageSize: 10,
+    total: 0,
+    totalPages: 1,
+  })
 
   async function fetchSettings(accountId: string) {
     if (!accountId)
@@ -194,7 +294,35 @@ export const useSettingStore = defineStore('setting', () => {
         settings.value.preferredSeedId = d.preferredSeed || 0
         settings.value.intervals = d.intervals || {}
         settings.value.friendQuietHours = d.friendQuietHours || { enabled: false, start: '23:00', end: '07:00' }
+        settings.value.tradeConfig = d.tradeConfig || {
+          sell: {
+            scope: 'fruit_only',
+            keepMinEachFruit: 0,
+            keepFruitIds: [],
+            rareKeep: {
+              enabled: false,
+              judgeBy: 'either',
+              minPlantLevel: 40,
+              minUnitPrice: 2000,
+            },
+            batchSize: 15,
+            previewBeforeManualSell: false,
+          },
+        }
         settings.value.automation = d.automation || {}
+        settings.value.reportConfig = d.reportConfig || {
+          enabled: false,
+          channel: 'webhook',
+          endpoint: '',
+          token: '',
+          title: '经营汇报',
+          hourlyEnabled: false,
+          hourlyMinute: 5,
+          dailyEnabled: true,
+          dailyHour: 21,
+          dailyMinute: 0,
+          retentionDays: 30,
+        }
         settings.value.ui = d.ui || {}
         // 蹲守配置挂到 settings 上层以便 StealSettings.vue 读取
         ; (settings.value as any).stakeoutSteal = d.stakeoutSteal || { enabled: false, delaySec: 3 }
@@ -226,6 +354,7 @@ export const useSettingStore = defineStore('setting', () => {
         preferredSeedId: newSettings.preferredSeedId,
         intervals: newSettings.intervals,
         friendQuietHours: newSettings.friendQuietHours,
+        tradeConfig: newSettings.tradeConfig,
       }
       // 蹲守配置透传
       // 工作流配置透传
@@ -234,6 +363,9 @@ export const useSettingStore = defineStore('setting', () => {
       }
       if (newSettings.stakeoutSteal) {
         settingsPayload.stakeoutSteal = newSettings.stakeoutSteal
+      }
+      if (newSettings.reportConfig) {
+        settingsPayload.reportConfig = newSettings.reportConfig
       }
 
       await api.post('/api/settings/save', settingsPayload, {
@@ -275,6 +407,147 @@ export const useSettingStore = defineStore('setting', () => {
     }
     finally {
       // loading 未在此处修改，无需 finally 中重置
+    }
+  }
+
+  async function sendReportTest(accountId: string) {
+    if (!accountId)
+      return { ok: false, error: '未选择账号' }
+    try {
+      const { data } = await api.post('/api/reports/test', {}, {
+        headers: { 'x-account-id': accountId },
+      })
+      if (data && data.ok)
+        return { ok: true, data: data.data }
+      return { ok: false, error: data?.error || '发送失败' }
+    }
+    catch (e: any) {
+      return { ok: false, error: e.response?.data?.error || e.message || '发送失败' }
+    }
+  }
+
+  async function sendReport(accountId: string, mode: 'hourly' | 'daily') {
+    if (!accountId)
+      return { ok: false, error: '未选择账号' }
+    try {
+      const { data } = await api.post('/api/reports/send', { mode }, {
+        headers: { 'x-account-id': accountId },
+      })
+      if (data && data.ok)
+        return { ok: true, data: data.data }
+      return { ok: false, error: data?.error || '发送失败' }
+    }
+    catch (e: any) {
+      return { ok: false, error: e.response?.data?.error || e.message || '发送失败' }
+    }
+  }
+
+  async function fetchReportLogs(accountId: string, options: { page?: number, pageSize?: number, limit?: number, mode?: string, status?: string, keyword?: string } = {}) {
+    if (!accountId) {
+      reportLogs.value = []
+      reportLogPagination.value = { page: 1, pageSize: 10, total: 0, totalPages: 1 }
+      return reportLogPagination.value
+    }
+    try {
+      const page = options.page ?? 1
+      const pageSize = options.pageSize ?? options.limit ?? 10
+      const { data } = await api.get('/api/reports/history', {
+        headers: { 'x-account-id': accountId },
+        params: {
+          page,
+          pageSize,
+          mode: options.mode || '',
+          status: options.status || '',
+          keyword: options.keyword || '',
+        },
+      })
+      if (data && data.ok && data.data && Array.isArray(data.data.items)) {
+        reportLogs.value = data.data.items
+        reportLogPagination.value = {
+          page: Number(data.data.page) || 1,
+          pageSize: Number(data.data.pageSize) || pageSize,
+          total: Number(data.data.total) || 0,
+          totalPages: Math.max(1, Number(data.data.totalPages) || 1),
+        }
+        return reportLogPagination.value
+      }
+      reportLogs.value = []
+      reportLogPagination.value = { page: 1, pageSize: Number(pageSize) || 10, total: 0, totalPages: 1 }
+      return reportLogPagination.value
+    }
+    catch (e) {
+      console.error('获取经营汇报历史失败:', e)
+      reportLogs.value = []
+      reportLogPagination.value = { page: 1, pageSize: 10, total: 0, totalPages: 1 }
+      return reportLogPagination.value
+    }
+  }
+
+  async function clearReportLogs(accountId: string) {
+    if (!accountId)
+      return { ok: false, error: '未选择账号' }
+    try {
+      const { data } = await api.delete('/api/reports/history', {
+        headers: { 'x-account-id': accountId },
+      })
+      if (data && data.ok) {
+        reportLogs.value = []
+        reportLogPagination.value = { page: 1, pageSize: reportLogPagination.value.pageSize || 10, total: 0, totalPages: 1 }
+        return { ok: true, data: data.data }
+      }
+      return { ok: false, error: data?.error || '清空失败' }
+    }
+    catch (e: any) {
+      return { ok: false, error: e.response?.data?.error || e.message || '清空失败' }
+    }
+  }
+
+  async function deleteReportLogsByIds(accountId: string, ids: number[]) {
+    if (!accountId)
+      return { ok: false, error: '未选择账号' }
+    const normalizedIds = Array.from(new Set((Array.isArray(ids) ? ids : []).map(id => Number(id)).filter(id => Number.isFinite(id) && id > 0)))
+    if (normalizedIds.length === 0)
+      return { ok: false, error: '未选择任何记录' }
+    try {
+      const { data } = await api.delete('/api/reports/history/items', {
+        headers: { 'x-account-id': accountId },
+        data: { ids: normalizedIds },
+      })
+      if (data && data.ok)
+        return { ok: true, data: data.data }
+      return { ok: false, error: data?.error || '删除失败' }
+    }
+    catch (e: any) {
+      return { ok: false, error: e.response?.data?.error || e.message || '删除失败' }
+    }
+  }
+
+  async function exportReportLogs(accountId: string, options: { mode?: string, status?: string, keyword?: string } = {}) {
+    if (!accountId)
+      return { ok: false, error: '未选择账号' }
+    try {
+      const response = await api.get('/api/reports/history/export', {
+        headers: { 'x-account-id': accountId },
+        params: {
+          mode: options.mode || '',
+          status: options.status || '',
+          keyword: options.keyword || '',
+        },
+        responseType: 'blob',
+      })
+      const disposition = String(response.headers['content-disposition'] || '')
+      const filenameMatch = disposition.match(/filename="?([^"]+)"?/)
+      return {
+        ok: true,
+        blob: response.data,
+        filename: filenameMatch ? filenameMatch[1] : 'report-history.csv',
+        count: Number(response.headers['x-export-count']) || 0,
+        total: Number(response.headers['x-export-total']) || 0,
+        truncated: String(response.headers['x-export-truncated'] || '0') === '1',
+      }
+    }
+    catch (e: any) {
+      return { ok: false, error: e.response?.data?.error || e.message || '导出失败' }
     }
   }
 
@@ -399,5 +672,5 @@ export const useSettingStore = defineStore('setting', () => {
     }
   }
 
-  return { settings, loading, timingLoading, fetchSettings, saveSettings, saveOfflineConfig, changePassword, fetchTrialCardConfig, fetchThirdPartyApiConfig, saveThirdPartyApiConfig, fetchTimingConfig, saveTimingConfig, fetchClusterConfig, saveClusterConfig }
+  return { settings, loading, timingLoading, reportLogs, reportLogPagination, fetchSettings, fetchReportLogs, clearReportLogs, deleteReportLogsByIds, exportReportLogs, saveSettings, saveOfflineConfig, sendReportTest, sendReport, changePassword, fetchTrialCardConfig, fetchThirdPartyApiConfig, saveThirdPartyApiConfig, fetchTimingConfig, saveTimingConfig, fetchClusterConfig, saveClusterConfig }
 })

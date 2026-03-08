@@ -499,4 +499,59 @@ async function doFriendOperation(friendGid, opType) {
     }
 }
 
-Object.assign(module.exports, { getAllFriends, getApplications, acceptFriends, enterFriendFarm, leaveFriendFarm, updateOperationLimits, canGetExp, canGetExpByCandidates, canOperate, getRemainingTimes, getOperationLimits, helpWater, helpWeed, helpInsecticide, stealHarvest, putPlantItems, putPlantItemsDetailed, putInsects, putWeeds, putInsectsDetailed, putWeedsDetailed, checkCanOperateRemote, doFriendOperation, resetGetAllMode, isGetAllMode });
+async function doFriendBatchOperation(friendGids = [], opType, options = {}) {
+    const list = Array.from(new Set((Array.isArray(friendGids) ? friendGids : []).map(Number).filter(gid => Number.isFinite(gid) && gid > 0)));
+    const continueOnError = options.continueOnError !== false;
+    const skipBlacklisted = options.skipBlacklisted !== false;
+    const stopOnBan = options.stopOnBan !== false;
+    const cooldownMs = Math.max(0, Number(options.cooldownMs || 1200));
+    const blacklist = new Set(getFriendBlacklist());
+    const results = [];
+    let successCount = 0;
+    let failCount = 0;
+    let totalAffectedCount = 0;
+
+    for (let i = 0; i < list.length; i++) {
+        const gid = list[i];
+        if (skipBlacklisted && blacklist.has(gid)) {
+            results.push({
+                gid,
+                ok: false,
+                skipped: true,
+                opType,
+                count: 0,
+                message: '好友在黑名单中，已跳过',
+            });
+            continue;
+        }
+
+        const result = await doFriendOperation(gid, opType);
+        results.push({ gid, ...result });
+        if (result && result.ok) {
+            successCount += 1;
+            totalAffectedCount += Math.max(0, Number(result.count || 0));
+        } else {
+            failCount += 1;
+        }
+
+        const message = String((result && result.message) || '');
+        if ((!result || !result.ok) && !continueOnError) break;
+        if (stopOnBan && (message.includes('1002003') || message.includes('封禁'))) break;
+
+        if (cooldownMs > 0 && i < list.length - 1) {
+            await sleep(cooldownMs + Math.floor(Math.random() * Math.min(600, cooldownMs || 1)));
+        }
+    }
+
+    return {
+        ok: true,
+        opType,
+        total: list.length,
+        successCount,
+        failCount,
+        totalAffectedCount,
+        results,
+    };
+}
+
+Object.assign(module.exports, { getAllFriends, getApplications, acceptFriends, enterFriendFarm, leaveFriendFarm, updateOperationLimits, canGetExp, canGetExpByCandidates, canOperate, getRemainingTimes, getOperationLimits, helpWater, helpWeed, helpInsecticide, stealHarvest, putPlantItems, putPlantItemsDetailed, putInsects, putWeeds, putInsectsDetailed, putWeedsDetailed, checkCanOperateRemote, doFriendOperation, doFriendBatchOperation, resetGetAllMode, isGetAllMode });

@@ -5,7 +5,7 @@
 
 const protobuf = require('protobufjs');
 const { getFruitName, getPlantByFruitId, getPlantBySeedId, getItemById, getItemImageById } = require('../config/gameConfig');
-const { isAutomationOn } = require('../models/store');
+const { isAutomationOn, getTradeConfig } = require('../models/store');
 const { sendMsgAsync, networkEvents, getUserState } = require('../utils/network');
 const { types } = require('../utils/proto');
 const { toLong, toNum, log, logWarn, sleep } = require('../utils/utils');
@@ -378,6 +378,290 @@ async function getBagDetail() {
 
 // ============ 出售逻辑 ============
 
+function getEffectiveTradeConfig(inputConfig) {
+    const base = (typeof getTradeConfig === 'function' ? getTradeConfig() : null) || {
+        sell: {
+            scope: 'fruit_only',
+            keepMinEachFruit: 0,
+            keepFruitIds: [],
+            rareKeep: { enabled: false, judgeBy: 'either', minPlantLevel: 40, minUnitPrice: 2000 },
+            batchSize: SELL_BATCH_SIZE,
+            previewBeforeManualSell: false,
+        },
+    };
+    if (!inputConfig || typeof inputConfig !== 'object') return base;
+    return {
+        ...base,
+        ...inputConfig,
+        sell: {
+            ...(base.sell || {}),
+            ...((inputConfig && inputConfig.sell) || {}),
+            rareKeep: {
+                ...(((base.sell || {}).rareKeep) || {}),
+                ...((((inputConfig && inputConfig.sell) || {}).rareKeep) || {}),
+            },
+        },
+    };
+}
+
+function shouldKeepFruitItem(item, tradeConfig) {
+    const sellCfg = ((tradeConfig || {}).sell || {});
+    const rareKeep = (sellCfg.rareKeep || {});
+    const reasons = [];
+    const itemId = toNum(item && item.id);
+    const keepIds = new Set(Array.isArray(sellCfg.keepFruitIds) ? sellCfg.keepFruitIds.map(Number) : []);
+    if (keepIds.has(itemId)) {
+        reasons.push('白名单保留');
+    }
+
+    if (rareKeep.enabled) {
+        const plant = getPlantByFruitId(itemId) || null;
+        const itemInfo = getItemById(itemId) || null;
+        const plantLevel = Number((plant && (plant.level || plant.unlock_lv || plant.unlock_level)) || 0);
+        const unitPrice = Number((itemInfo && itemInfo.price) || item?.price || 0);
+        const meetsPlantLevel = rareKeep.minPlantLevel > 0 && plantLevel >= Number(rareKeep.minPlantLevel || 0);
+        const meetsUnitPrice = rareKeep.minUnitPrice > 0 && unitPrice >= Number(rareKeep.minUnitPrice || 0);
+        if (rareKeep.judgeBy === 'plant_level' && meetsPlantLevel) {
+            reasons.push(`作物等级>=${rareKeep.minPlantLevel}`);
+        } else if (rareKeep.judgeBy === 'unit_price' && meetsUnitPrice) {
+            reasons.push(`单价>=${rareKeep.minUnitPrice}`);
+        } else if (rareKeep.judgeBy === 'either' && (meetsPlantLevel || meetsUnitPrice)) {
+            if (meetsPlantLevel) reasons.push(`作物等级>=${rareKeep.minPlantLevel}`);
+            if (meetsUnitPrice) reasons.push(`单价>=${rareKeep.minUnitPrice}`);
+        }
+    }
+
+    return {
+        keep: reasons.length > 0,
+        reasons,
+    };
+}
+
+function buildSellPlanByPolicy(bagItems, tradeConfigInput) {
+    const tradeConfig = getEffectiveTradeConfig(tradeConfigInput);
+    const sellCfg = tradeConfig.sell || {};
+    const items = Array.isArray(bagItems) ? bagItems : [];
+    const rows = [];
+    let totalSellCount = 0;
+    let totalKeepCount = 0;
+    let expectedGold = 0;
+
+    for (const item of items) {
+        const id = toNum(item && item.id);
+        const count = Math.max(0, toNum(item && item.count));
+        if (!isFruitItemId(id) || count <= 0) continue;
+
+        const keepInfo = shouldKeepFruitItem(item, tradeConfig);
+        const keepMin = Math.max(0, Number(sellCfg.keepMinEachFruit || 0));
+        const forcedKeepCount = keepInfo.keep ? count : Math.min(count, keepMin);
+        const sellCount = Math.max(0, count - forcedKeepCount);
+        const keepCount = count - sellCount;
+        const unitPrice = Math.max(0, Number(item && item.price) || 0);
+
+        rows.push({
+            id,
+            name: item.name || `${getFruitName(id)}果实`,
+            count,
+            category: item.category || 'fruit',
+            unitPrice,
+            sellCount,
+            keepCount,
+            sellValue: sellCount * unitPrice,
+            keepReasons: keepInfo.reasons,
+            image: item.image || '',
+        });
+
+        totalSellCount += sellCount;
+        totalKeepCount += keepCount;
+        expectedGold += sellCount * unitPrice;
+    }
+
+    rows.sort((a, b) => {
+        if (b.sellValue !== a.sellValue) return b.sellValue - a.sellValue;
+        return Number(a.id || 0) - Number(b.id || 0);
+    });
+
+    return {
+        generatedAt: Date.now(),
+        tradeConfig,
+        totalKinds: rows.length,
+        totalSellKinds: rows.filter(row => row.sellCount > 0).length,
+        totalKeepKinds: rows.filter(row => row.keepCount > 0).length,
+        totalSellCount,
+        totalKeepCount,
+        expectedGold,
+        items: rows,
+    };
+}
+
+async function getSellPreview(tradeConfigInput) {
+    const bag = await getBagDetail();
+    return buildSellPlanByPolicy(bag.items, tradeConfigInput);
+}
+
+async function executeSellPlan(plan, options = {}) {
+    const rows = Array.isArray(plan && plan.items) ? plan.items : [];
+    const toSell = rows
+        .filter(row => Number(row.sellCount || 0) > 0)
+        .map(row => ({
+            id: toLong(row.id),
+            count: toLong(row.sellCount),
+        }));
+    if (toSell.length === 0) {
+        return {
+            ok: true,
+            soldKinds: 0,
+            soldCount: 0,
+            goldEarned: 0,
+            message: '没有符合策略的果实可出售',
+            plan,
+        };
+    }
+
+    const sellCfg = (((plan || {}).tradeConfig || {}).sell || {});
+    const batchSize = Math.max(1, Number(sellCfg.batchSize || SELL_BATCH_SIZE) || SELL_BATCH_SIZE);
+    const totalsBefore = getCurrentTotals();
+    const goldBefore = totalsBefore.gold;
+    let serverGoldTotal = 0;
+    let knownGold = goldBefore;
+    const soldRows = [];
+
+    for (let i = 0; i < toSell.length; i += batchSize) {
+        const batch = toSell.slice(i, i + batchSize);
+        try {
+            const reply = await sellItems(batch);
+            const inferred = deriveGoldGainFromSellReply(reply, knownGold);
+            const gained = Math.max(0, toNum(inferred.gain));
+            knownGold = inferred.nextKnownGold;
+            if (gained > 0) serverGoldTotal += gained;
+            soldRows.push(...batch);
+        } catch (batchErr) {
+            logWarn('仓库', `批量出售失败，改为逐个重试: ${batchErr.message}`);
+            for (const it of batch) {
+                try {
+                    const singleReply = await sellItems([it]);
+                    const inferred = deriveGoldGainFromSellReply(singleReply, knownGold);
+                    const gained = Math.max(0, toNum(inferred.gain));
+                    knownGold = inferred.nextKnownGold;
+                    if (gained > 0) serverGoldTotal += gained;
+                    soldRows.push(it);
+                } catch (singleErr) {
+                    const sid = toNum(it.id);
+                    const sc = toNum(it.count);
+                    logWarn('仓库', `跳过不可售物品: ID=${sid} x${sc} (${singleErr.message})`, {
+                        module: 'warehouse',
+                        event: 'sell_skip_invalid',
+                        result: 'skip',
+                        itemId: sid,
+                        count: sc,
+                    });
+                }
+            }
+        }
+        if (i + batchSize < toSell.length) await sleep(300);
+    }
+
+    let goldAfter = goldBefore;
+    const startWait = Date.now();
+    while (Date.now() - startWait < 2000) {
+        const currentGold = (getUserState() && getUserState().gold) ? getUserState().gold : goldAfter;
+        if (currentGold !== goldBefore) {
+            goldAfter = currentGold;
+            break;
+        }
+        await sleep(200 + Math.floor(Math.random() * 100));
+    }
+
+    const totalsAfter = getCurrentTotals();
+    const totalGoldDelta = goldAfter > goldBefore ? (goldAfter - goldBefore) : 0;
+    let bagDelta = 0;
+    if (totalGoldDelta <= 0 && serverGoldTotal <= 0) {
+        try {
+            const bagAfter = await getBag();
+            const bagGold = getGoldFromItems(getBagItems(bagAfter));
+            if (bagGold > goldBefore) bagDelta = bagGold - goldBefore;
+        } catch { }
+    }
+
+    const totalGoldEarned = Math.max(serverGoldTotal, totalGoldDelta, bagDelta);
+    if (totalGoldDelta <= 0 && totalGoldEarned > 0) {
+        const state = getUserState();
+        if (state) {
+            state.gold = Number(state.gold || 0) + totalGoldEarned;
+            updateStatusGold(state.gold);
+        }
+    }
+
+    const soldKinds = soldRows.length;
+    const soldCount = soldRows.reduce((sum, row) => sum + Math.max(0, toNum(row.count)), 0);
+    const soldNames = soldRows
+        .map(row => {
+            const item = rows.find(it => Number(it.id || 0) === Number(row.id || 0));
+            const name = item && item.name ? item.name : `物品#${toNum(row.id)}`;
+            return `${name}x${toNum(row.count)}`;
+        });
+
+    log('仓库', `出售 ${soldNames.join(', ')}${totalGoldEarned > 0 ? `，获得 ${totalGoldEarned} 金币` : ''}`, {
+        module: 'warehouse',
+        event: options.event || 'sell_policy',
+        result: totalGoldEarned > 0 ? 'ok' : 'unknown_gain',
+        soldKinds,
+        soldCount,
+        gold: totalGoldEarned,
+        totalsBefore,
+        totalsAfter,
+        mode: options.mode || 'policy',
+        reason: options.reason || '',
+    });
+
+    if (totalGoldEarned > 0) {
+        networkEvents.emit('sell', totalGoldEarned);
+    }
+
+    return {
+        ok: true,
+        soldKinds,
+        soldCount,
+        goldEarned: totalGoldEarned,
+        message: soldCount > 0 ? `已出售 ${soldCount} 个果实` : '没有成功出售任何果实',
+        plan,
+    };
+}
+
+async function sellByPolicy(tradeConfigInput, options = {}) {
+    const plan = await getSellPreview(tradeConfigInput);
+    return executeSellPlan(plan, {
+        mode: options.manual ? 'manual_policy' : 'auto_policy',
+        event: options.event || 'sell_policy',
+        reason: options.reason || '',
+    });
+}
+
+async function sellSelectedItems(itemIds = [], options = {}) {
+    const selectedIds = new Set((Array.isArray(itemIds) ? itemIds : []).map(Number).filter(id => Number.isFinite(id) && id > 0));
+    if (!selectedIds.size) {
+        return { ok: false, soldKinds: 0, soldCount: 0, goldEarned: 0, message: '未选择任何果实' };
+    }
+
+    const plan = await getSellPreview(options.tradeConfig);
+    const filteredPlan = {
+        ...plan,
+        items: (plan.items || []).map(item => {
+            if (!selectedIds.has(Number(item.id || 0))) {
+                return { ...item, sellCount: 0, sellValue: 0 };
+            }
+            return options.respectPolicy === false
+                ? { ...item, sellCount: item.count, keepCount: 0, keepReasons: [], sellValue: item.count * item.unitPrice }
+                : item;
+        }),
+    };
+    return executeSellPlan(filteredPlan, {
+        mode: 'manual_selected',
+        event: 'sell_selected',
+        reason: options.reason || '',
+    });
+}
+
 /**
  * 检查并出售所有果实
  */
@@ -387,112 +671,9 @@ async function sellAllFruits() {
         return;
     }
     try {
-        const bagReply = await getBag();
-        const items = getBagItems(bagReply);
-
-        const toSell = [];
-        const names = [];
-        for (const item of items) {
-            const id = toNum(item.id);
-            const count = toNum(item.count);
-            if (isFruitItemId(id) && count > 0) {
-                toSell.push(item);
-                names.push(`${getFruitName(id)}x${count}`);
-            }
-        }
-
-        if (toSell.length === 0) {
+        const result = await sellByPolicy(null, { manual: false, event: 'sell_policy_auto', reason: 'auto_after_scan' });
+        if (!result || result.soldCount <= 0) {
             log('仓库', '无果实可出售');
-            return;
-        }
-
-        const totalsBefore = getCurrentTotals();
-        const goldBefore = totalsBefore.gold;
-        let serverGoldTotal = 0;
-        let knownGold = goldBefore;
-        for (let i = 0; i < toSell.length; i += SELL_BATCH_SIZE) {
-            const batch = toSell.slice(i, i + SELL_BATCH_SIZE);
-            try {
-                const reply = await sellItems(batch);
-                const inferred = deriveGoldGainFromSellReply(reply, knownGold);
-                const gained = Math.max(0, toNum(inferred.gain));
-                knownGold = inferred.nextKnownGold;
-                if (gained > 0) serverGoldTotal += gained;
-            } catch (batchErr) {
-                // 某个条目可能参数非法，降级为逐个出售，跳过错误条目
-                logWarn('仓库', `批量出售失败，改为逐个重试: ${batchErr.message}`);
-                for (const it of batch) {
-                    try {
-                        const singleReply = await sellItems([it]);
-                        const inferred = deriveGoldGainFromSellReply(singleReply, knownGold);
-                        const gained = Math.max(0, toNum(inferred.gain));
-                        knownGold = inferred.nextKnownGold;
-                        if (gained > 0) serverGoldTotal += gained;
-                    } catch (singleErr) {
-                        const sid = toNum(it.id);
-                        const sc = toNum(it.count);
-                        logWarn('仓库', `跳过不可售物品: ID=${sid} x${sc} (${singleErr.message})`, {
-                            module: 'warehouse',
-                            event: 'sell_skip_invalid',
-                            result: 'skip',
-                            itemId: sid,
-                            count: sc,
-                        });
-                    }
-                }
-            }
-            if (i + SELL_BATCH_SIZE < toSell.length) await sleep(300);
-        }
-        // 等待金币通知更新（最多 2s）
-        let goldAfter = goldBefore;
-        const startWait = Date.now();
-        while (Date.now() - startWait < 2000) {
-            const currentGold = (getUserState() && getUserState().gold) ? getUserState().gold : goldAfter;
-            if (currentGold !== goldBefore) {
-                goldAfter = currentGold;
-                break;
-            }
-            await sleep(200 + Math.floor(Math.random() * 100));
-        }
-        const totalsAfter = getCurrentTotals();
-        const totalGoldDelta = goldAfter > goldBefore ? (goldAfter - goldBefore) : 0;
-        const totalsDeltaGold = totalsAfter.gold - totalsBefore.gold;
-        const totalsDeltaExp = totalsAfter.exp - totalsBefore.exp;
-
-        // 通知缺失时，尝试从背包读取金币做最终兜底
-        let bagDelta = 0;
-        if (totalGoldDelta <= 0 && serverGoldTotal <= 0) {
-            try {
-                const bagAfter = await getBag();
-                const bagGold = getGoldFromItems(getBagItems(bagAfter));
-                if (bagGold > goldBefore) bagDelta = bagGold - goldBefore;
-            } catch { }
-        }
-
-        const totalGoldEarned = Math.max(serverGoldTotal, totalGoldDelta, bagDelta);
-        if (totalGoldDelta <= 0 && totalGoldEarned > 0) {
-            // 某些情况下 ItemNotify 丢失，使用出售回包做金币兜底同步
-            const state = getUserState();
-            if (state) {
-                state.gold = Number(state.gold || 0) + totalGoldEarned;
-                updateStatusGold(state.gold);
-            }
-        }
-        log('仓库', `出售 ${names.join(', ')}${totalGoldEarned > 0 ? `，获得 ${totalGoldEarned} 金币` : ''}`, {
-            module: 'warehouse',
-            event: totalGoldEarned > 0 ? 'sell_success' : 'sell_done',
-            result: totalGoldEarned > 0 ? 'ok' : 'unknown_gain',
-            count: toSell.length,
-            gold: totalGoldEarned,
-            totalsBefore,
-            totalsAfter,
-            totalsDeltaGold,
-            totalsDeltaExp,
-        });
-
-        // 发送出售事件，用于统计金币收益
-        if (totalGoldEarned > 0) {
-            networkEvents.emit('sell', totalGoldEarned);
         }
     } catch (e) {
         logWarn('仓库', `出售失败: ${e.message}`);
@@ -502,7 +683,11 @@ async function sellAllFruits() {
 module.exports = {
     getBag,
     getBagDetail,
+    getSellPreview,
+    buildSellPlanByPolicy,
     sellItems,
+    sellByPolicy,
+    sellSelectedItems,
     useItem,
     batchUseItems,
     openFertilizerGiftPacksSilently,

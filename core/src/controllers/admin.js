@@ -21,7 +21,7 @@ const { addOrUpdateAccount, deleteAccount } = store;
 const { findAccountByRef, normalizeAccountRef, resolveAccountId } = require('../services/account-resolver');
 const { createModuleLogger } = require('../services/logger');
 const { getPool } = require('../services/mysql-db');
-const { getAnnouncements, saveAnnouncement, deleteAnnouncement } = require('../services/database');
+const { getAnnouncements, saveAnnouncement, deleteAnnouncement, getReportLogs, exportReportLogs, deleteReportLogsByIds, clearReportLogs } = require('../services/database');
 const { MiniProgramLoginSession } = require('../services/qrlogin');
 const { getSchedulerRegistrySnapshot } = require('../services/scheduler');
 const { validateSettings } = require('../services/config-validator');
@@ -89,6 +89,31 @@ function getClientIP(req) {
         }
     }
     return req.ip || req.connection.remoteAddress || '0.0.0.0';
+}
+
+function escapeCsvCell(value) {
+    const text = String(value === undefined || value === null ? '' : value);
+    return `"${text.replace(/"/g, '""')}"`;
+}
+
+function buildReportHistoryCsv(rows = []) {
+    const header = ['ID', '账号ID', '账号名称', '类型', '结果', '渠道', '标题', '正文', '失败原因', '创建时间'];
+    const lines = [header.map(escapeCsvCell).join(',')];
+    for (const item of (Array.isArray(rows) ? rows : [])) {
+        lines.push([
+            item.id,
+            item.accountId,
+            item.accountName,
+            item.mode,
+            item.ok ? '成功' : '失败',
+            item.channel,
+            item.title,
+            item.content,
+            item.errorMessage,
+            item.createdAt,
+        ].map(escapeCsvCell).join(','));
+    }
+    return `\uFEFF${lines.join('\n')}`;
 }
 
 function startAdminServer(dataProvider) {
@@ -731,6 +756,57 @@ function startAdminServer(dataProvider) {
         }
     });
 
+    app.post('/api/friends/batch-op', accountOwnershipRequired, async (req, res) => {
+        const id = await getAccId(req);
+        if (!id) return res.status(400).json({ ok: false, error: 'Missing x-account-id' });
+        try {
+            const body = (req.body && typeof req.body === 'object') ? req.body : {};
+            const gids = Array.isArray(body.gids) ? body.gids.map(Number).filter(n => Number.isFinite(n) && n > 0) : [];
+            const opType = String(body.opType || '').trim();
+            const options = (body.options && typeof body.options === 'object') ? body.options : {};
+
+            if (!gids.length) return res.status(400).json({ ok: false, error: 'Missing gids' });
+            if (!opType) return res.status(400).json({ ok: false, error: 'Missing opType' });
+
+            if (opType === 'blacklist_add' || opType === 'blacklist_remove') {
+                const current = store.getFriendBlacklist ? store.getFriendBlacklist(id) : [];
+                const currentSet = new Set(current.map(Number));
+                const results = [];
+                for (const gid of gids) {
+                    if (opType === 'blacklist_add') {
+                        currentSet.add(gid);
+                        results.push({ gid, ok: true, opType, message: '已加入黑名单' });
+                    } else {
+                        currentSet.delete(gid);
+                        results.push({ gid, ok: true, opType, message: '已移出黑名单' });
+                    }
+                }
+                const saved = store.setFriendBlacklist ? store.setFriendBlacklist(id, Array.from(currentSet)) : Array.from(currentSet);
+                if (provider && typeof provider.broadcastConfig === 'function') {
+                    provider.broadcastConfig(id);
+                }
+                return res.json({
+                    ok: true,
+                    data: {
+                        ok: true,
+                        opType,
+                        total: gids.length,
+                        successCount: gids.length,
+                        failCount: 0,
+                        totalAffectedCount: gids.length,
+                        blacklist: saved,
+                        results,
+                    },
+                });
+            }
+
+            const data = await provider.doFriendBatchOp(id, gids, opType, options);
+            res.json({ ok: true, data });
+        } catch (e) {
+            handleApiError(res, e);
+        }
+    });
+
     // API: 好友黑名单
     app.get('/api/friend-blacklist', accountOwnershipRequired, async (req, res) => {
         const id = await getAccId(req);
@@ -777,6 +853,74 @@ function startAdminServer(dataProvider) {
         if (!id) return res.status(400).json({ ok: false });
         try {
             const data = await provider.getBag(id);
+            res.json({ ok: true, data });
+        } catch (e) {
+            handleApiError(res, e);
+        }
+    });
+
+    app.get('/api/mall/goods', accountOwnershipRequired, async (req, res) => {
+        const id = await getAccId(req);
+        if (!id) return res.status(400).json({ ok: false });
+        try {
+            const slotType = Number(req.query.slotType || 1) || 1;
+            const data = await provider.getMallGoods(id, slotType);
+            res.json({ ok: true, data });
+        } catch (e) {
+            handleApiError(res, e);
+        }
+    });
+
+    app.post('/api/mall/purchase', accountOwnershipRequired, async (req, res) => {
+        const id = await getAccId(req);
+        if (!id) return res.status(400).json({ ok: false });
+        try {
+            const goodsId = Number((req.body || {}).goodsId);
+            const count = Number((req.body || {}).count || 1);
+            if (!goodsId || goodsId <= 0) {
+                return res.status(400).json({ ok: false, error: 'Missing goodsId' });
+            }
+            const data = await provider.buyMallGoods(id, goodsId, Math.max(1, count || 1));
+            res.json({ ok: true, data });
+        } catch (e) {
+            handleApiError(res, e);
+        }
+    });
+
+    app.get('/api/bag/sell-preview', accountOwnershipRequired, async (req, res) => {
+        const id = await getAccId(req);
+        if (!id) return res.status(400).json({ ok: false });
+        try {
+            const data = await provider.getSellPreview(id);
+            res.json({ ok: true, data });
+        } catch (e) {
+            handleApiError(res, e);
+        }
+    });
+
+    app.post('/api/bag/sell', accountOwnershipRequired, async (req, res) => {
+        const id = await getAccId(req);
+        if (!id) return res.status(400).json({ ok: false });
+        try {
+            const data = await provider.sellByPolicy(id, (req.body || {}).tradeConfig, {
+                manual: true,
+                reason: 'manual_policy',
+            });
+            res.json({ ok: true, data });
+        } catch (e) {
+            handleApiError(res, e);
+        }
+    });
+
+    app.post('/api/bag/sell-selected', accountOwnershipRequired, async (req, res) => {
+        const id = await getAccId(req);
+        if (!id) return res.status(400).json({ ok: false });
+        try {
+            const itemIds = Array.isArray((req.body || {}).itemIds) ? req.body.itemIds : [];
+            const data = await provider.sellSelected(id, itemIds, {
+                respectPolicy: (req.body || {}).respectPolicy !== false,
+                reason: 'manual_selected',
+            });
             res.json({ ok: true, data });
         } catch (e) {
             handleApiError(res, e);
@@ -951,10 +1095,11 @@ function startAdminServer(dataProvider) {
                     return val !== undefined && Number.parseInt(val, 10) < threshold;
                 };
                 if (checkBlock(ints.farm, 15) || checkBlock(ints.farmMin, 15) ||
-                    checkBlock(ints.friend, 60) || checkBlock(ints.friendMin, 60)) {
+                    checkBlock(ints.friend, 60) || checkBlock(ints.friendMin, 60) ||
+                    checkBlock(ints.helpMin, 60) || checkBlock(ints.stealMin, 60)) {
                     return res.status(400).json({
                         ok: false,
-                        error: '系统保护拦截：此配置设定的轮询时间过度短频，将导致腾讯 1002003 风控锁定。根据系统防线，普通用户农田循环下限为 15秒、好友巡查下限为 60秒。请上调参数后再保存！'
+                        error: '系统保护拦截：此配置设定的轮询时间过度短频，将导致腾讯 1002003 风控锁定。根据系统防线，普通用户农田循环下限为 15秒，好友/帮忙/偷菜巡查下限为 60秒。请上调参数后再保存！'
                     });
                 }
 
@@ -1098,10 +1243,128 @@ function startAdminServer(dataProvider) {
             const offlineReminder = store.getOfflineReminder
                 ? store.getOfflineReminder()
                 : { channel: 'webhook', reloginUrlMode: 'none', endpoint: '', token: '', title: '账号下线提醒', msg: '账号下线', offlineDeleteSec: 0 };
+            const reportConfig = store.getReportConfig
+                ? store.getReportConfig(id)
+                : { enabled: false, channel: 'webhook', endpoint: '', token: '', title: '经营汇报', hourlyEnabled: false, hourlyMinute: 5, dailyEnabled: true, dailyHour: 21, dailyMinute: 0 };
+            const tradeConfig = store.getTradeConfig
+                ? store.getTradeConfig(id)
+                : { sell: { scope: 'fruit_only', keepMinEachFruit: 0, keepFruitIds: [], rareKeep: { enabled: false, judgeBy: 'either', minPlantLevel: 40, minUnitPrice: 2000 }, batchSize: 15, previewBeforeManualSell: false } };
             // 从完整配置快照中提取工作流编排配置
             const fullSnapshot = store.getConfigSnapshot(id);
             const workflowConfig = fullSnapshot.workflowConfig || { farm: { enabled: false, minInterval: 30, maxInterval: 120, nodes: [] }, friend: { enabled: false, minInterval: 60, maxInterval: 300, nodes: [] } };
-            res.json({ ok: true, data: { intervals, strategy, plantingStrategy: strategy, preferredSeed, preferredSeedId: preferredSeed, friendQuietHours, automation, stakeoutSteal, workflowConfig, ui, offlineReminder } });
+            res.json({ ok: true, data: { intervals, strategy, plantingStrategy: strategy, preferredSeed, preferredSeedId: preferredSeed, friendQuietHours, automation, stakeoutSteal, workflowConfig, tradeConfig, reportConfig, ui, offlineReminder } });
+        } catch (e) {
+            res.status(500).json({ ok: false, error: e.message });
+        }
+    });
+
+    app.post('/api/reports/test', accountOwnershipRequired, async (req, res) => {
+        try {
+            const id = await getAccId(req);
+            if (!id) {
+                return res.status(400).json({ ok: false, error: 'Missing x-account-id' });
+            }
+            if (!provider || typeof provider.sendAccountReportTest !== 'function') {
+                return res.status(503).json({ ok: false, error: '经营汇报服务未启动' });
+            }
+            const result = await provider.sendAccountReportTest(id);
+            if (!result || !result.ok) {
+                return res.status(400).json({ ok: false, error: result && result.error ? result.error : '发送失败', data: result || {} });
+            }
+            res.json({ ok: true, data: result });
+        } catch (e) {
+            res.status(500).json({ ok: false, error: e.message });
+        }
+    });
+
+    app.post('/api/reports/send', accountOwnershipRequired, async (req, res) => {
+        try {
+            const id = await getAccId(req);
+            if (!id) {
+                return res.status(400).json({ ok: false, error: 'Missing x-account-id' });
+            }
+            const mode = String(((req.body || {}).mode) || '').trim().toLowerCase();
+            if (mode !== 'hourly' && mode !== 'daily') {
+                return res.status(400).json({ ok: false, error: 'mode 仅支持 hourly 或 daily' });
+            }
+            if (!provider || typeof provider.sendAccountReport !== 'function') {
+                return res.status(503).json({ ok: false, error: '经营汇报服务未启动' });
+            }
+            const result = await provider.sendAccountReport(id, mode);
+            if (!result || !result.ok) {
+                return res.status(400).json({ ok: false, error: result && result.error ? result.error : '发送失败', data: result || {} });
+            }
+            res.json({ ok: true, data: result });
+        } catch (e) {
+            res.status(500).json({ ok: false, error: e.message });
+        }
+    });
+
+    app.get('/api/reports/history', accountOwnershipRequired, async (req, res) => {
+        try {
+            const id = await getAccId(req);
+            if (!id) {
+                return res.status(400).json({ ok: false, error: 'Missing x-account-id' });
+            }
+            const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+            const pageSize = Math.max(1, Math.min(100, Number.parseInt(req.query.pageSize !== undefined ? req.query.pageSize : req.query.limit, 10) || 10));
+            const mode = String(req.query.mode || '').trim().toLowerCase();
+            const status = String(req.query.status || '').trim().toLowerCase();
+            const keyword = String(req.query.keyword !== undefined ? req.query.keyword : (req.query.q || '')).trim();
+            const data = await getReportLogs(id, { page, pageSize, mode, status, keyword });
+            res.json({ ok: true, data });
+        } catch (e) {
+            res.status(500).json({ ok: false, error: e.message });
+        }
+    });
+
+    app.get('/api/reports/history/export', accountOwnershipRequired, async (req, res) => {
+        try {
+            const id = await getAccId(req);
+            if (!id) {
+                return res.status(400).json({ ok: false, error: 'Missing x-account-id' });
+            }
+            const mode = String(req.query.mode || '').trim().toLowerCase();
+            const status = String(req.query.status || '').trim().toLowerCase();
+            const keyword = String(req.query.keyword !== undefined ? req.query.keyword : (req.query.q || '')).trim();
+            const data = await exportReportLogs(id, { mode, status, keyword, maxRows: 2000 });
+            const filename = `report-history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '_')}-${Date.now()}.csv`;
+            res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+            res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+            res.setHeader('X-Export-Count', String(data.items.length));
+            res.setHeader('X-Export-Total', String(data.total));
+            res.setHeader('X-Export-Truncated', data.truncated ? '1' : '0');
+            res.send(buildReportHistoryCsv(data.items));
+        } catch (e) {
+            res.status(500).json({ ok: false, error: e.message });
+        }
+    });
+
+    app.delete('/api/reports/history/items', accountOwnershipRequired, async (req, res) => {
+        try {
+            const id = await getAccId(req);
+            if (!id) {
+                return res.status(400).json({ ok: false, error: 'Missing x-account-id' });
+            }
+            const ids = Array.isArray(req.body && req.body.ids) ? req.body.ids : [];
+            if (ids.length === 0) {
+                return res.status(400).json({ ok: false, error: 'ids 不能为空' });
+            }
+            const result = await deleteReportLogsByIds(id, ids);
+            res.json({ ok: true, data: result });
+        } catch (e) {
+            res.status(500).json({ ok: false, error: e.message });
+        }
+    });
+
+    app.delete('/api/reports/history', accountOwnershipRequired, async (req, res) => {
+        try {
+            const id = await getAccId(req);
+            if (!id) {
+                return res.status(400).json({ ok: false, error: 'Missing x-account-id' });
+            }
+            const result = await clearReportLogs(id);
+            res.json({ ok: true, data: result });
         } catch (e) {
             res.status(500).json({ ok: false, error: e.message });
         }

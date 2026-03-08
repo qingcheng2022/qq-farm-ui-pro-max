@@ -249,6 +249,201 @@ async function invalidateAnnouncementCache() {
     } catch (e) { /* ignore */ }
 }
 
+async function insertReportLog(entry = {}) {
+    const pool = getPool();
+    if (!pool) return { ok: false };
+    const payload = (entry && typeof entry === 'object') ? entry : {};
+    await pool.execute(
+        `INSERT INTO report_logs
+        (account_id, account_name, mode, ok, channel, title, content, error_message)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+            String(payload.accountId || '').trim(),
+            String(payload.accountName || '').trim(),
+            String(payload.mode || 'test').trim(),
+            payload.ok ? 1 : 0,
+            String(payload.channel || '').trim(),
+            String(payload.title || '').trim(),
+            String(payload.content || ''),
+            String(payload.errorMessage || '').trim(),
+        ],
+    );
+    return { ok: true };
+}
+
+function normalizeReportLogFilters(options = {}) {
+    const opts = (options && typeof options === 'object') ? options : {};
+    const rawMode = String(opts.mode || '').trim().toLowerCase();
+    const rawStatus = String(opts.status || '').trim().toLowerCase();
+    const keyword = String(opts.keyword !== undefined ? opts.keyword : (opts.q || '')).trim().slice(0, 100);
+    const allowedModes = new Set(['test', 'hourly', 'daily']);
+    const allowedStatus = new Set(['success', 'failed']);
+    return {
+        mode: allowedModes.has(rawMode) ? rawMode : '',
+        status: allowedStatus.has(rawStatus) ? rawStatus : '',
+        keyword,
+    };
+}
+
+function buildReportLogWhereClause(accountId, options = {}) {
+    const normalizedAccountId = String(accountId || '').trim();
+    const filters = normalizeReportLogFilters(options);
+    const params = [normalizedAccountId];
+    let whereSql = 'WHERE account_id = ?';
+    if (filters.mode) {
+        whereSql += ' AND mode = ?';
+        params.push(filters.mode);
+    }
+    if (filters.status) {
+        whereSql += filters.status === 'success' ? ' AND ok = 1' : ' AND ok = 0';
+    }
+    if (filters.keyword) {
+        const keywordPattern = `%${filters.keyword}%`;
+        whereSql += ' AND (title LIKE ? OR content LIKE ? OR error_message LIKE ?)';
+        params.push(keywordPattern, keywordPattern, keywordPattern);
+    }
+    return { whereSql, params };
+}
+
+function mapReportLogRows(rows) {
+    return (rows || []).map(row => ({
+        id: row.id,
+        accountId: String(row.account_id || ''),
+        accountName: row.account_name || '',
+        mode: row.mode || 'test',
+        ok: !!row.ok,
+        channel: row.channel || '',
+        title: row.title || '',
+        content: row.content || '',
+        errorMessage: row.error_message || '',
+        createdAt: row.created_at,
+    }));
+}
+
+async function getReportLogs(accountId, options = {}) {
+    const pool = getPool();
+    if (!pool) {
+        return { items: [], total: 0, page: 1, pageSize: 10, totalPages: 1 };
+    }
+    const opts = (options && typeof options === 'object') ? options : { pageSize: options };
+    const pageSize = Math.max(1, Math.min(100, Number.parseInt(opts.pageSize !== undefined ? opts.pageSize : opts.limit, 10) || 10));
+    const page = Math.max(1, Number.parseInt(opts.page, 10) || 1);
+    const offset = (page - 1) * pageSize;
+    const { whereSql, params } = buildReportLogWhereClause(accountId, opts);
+    const [[countRow]] = await pool.execute(
+        `SELECT COUNT(*) AS total FROM report_logs ${whereSql}`,
+        params,
+    );
+    const total = Math.max(0, Number(countRow && countRow.total) || 0);
+    const [rows] = await pool.execute(
+        `SELECT id, account_id, account_name, mode, ok, channel, title, content, error_message, created_at
+         FROM report_logs
+         ${whereSql}
+         ORDER BY id DESC
+         LIMIT ${pageSize} OFFSET ${offset}`,
+        params,
+    );
+    return {
+        items: mapReportLogRows(rows),
+        total,
+        page,
+        pageSize,
+        totalPages: Math.max(1, Math.ceil(total / pageSize)),
+    };
+}
+
+async function exportReportLogs(accountId, options = {}) {
+    const pool = getPool();
+    if (!pool) {
+        return { items: [], total: 0, maxRows: 1000, truncated: false };
+    }
+    const opts = (options && typeof options === 'object') ? options : {};
+    const maxRows = Math.max(1, Math.min(2000, Number.parseInt(opts.maxRows, 10) || 1000));
+    const { whereSql, params } = buildReportLogWhereClause(accountId, opts);
+    const [[countRow]] = await pool.execute(
+        `SELECT COUNT(*) AS total FROM report_logs ${whereSql}`,
+        params,
+    );
+    const total = Math.max(0, Number(countRow && countRow.total) || 0);
+    const [rows] = await pool.execute(
+        `SELECT id, account_id, account_name, mode, ok, channel, title, content, error_message, created_at
+         FROM report_logs
+         ${whereSql}
+         ORDER BY id DESC
+         LIMIT ${maxRows}`,
+        params,
+    );
+    return {
+        items: mapReportLogRows(rows),
+        total,
+        maxRows,
+        truncated: total > rows.length,
+    };
+}
+
+async function deleteReportLogsByIds(accountId, ids = []) {
+    const pool = getPool();
+    if (!pool) return { ok: false, affectedRows: 0, requestedIds: 0 };
+    const normalizedAccountId = String(accountId || '').trim();
+    const normalizedIds = Array.from(new Set(
+        (Array.isArray(ids) ? ids : [ids])
+            .map(id => Number.parseInt(id, 10))
+            .filter(id => Number.isFinite(id) && id > 0),
+    ));
+    if (!normalizedAccountId || normalizedIds.length === 0) {
+        return { ok: false, affectedRows: 0, requestedIds: 0 };
+    }
+    const placeholders = normalizedIds.map(() => '?').join(', ');
+    const [result] = await pool.execute(
+        `DELETE FROM report_logs
+         WHERE account_id = ?
+           AND id IN (${placeholders})`,
+        [normalizedAccountId, ...normalizedIds],
+    );
+    return {
+        ok: true,
+        affectedRows: Number(result && result.affectedRows) || 0,
+        requestedIds: normalizedIds.length,
+    };
+}
+
+async function clearReportLogs(accountId) {
+    const pool = getPool();
+    if (!pool) return { ok: false, affectedRows: 0 };
+    const [result] = await pool.execute(
+        'DELETE FROM report_logs WHERE account_id = ?',
+        [String(accountId || '').trim()],
+    );
+    return {
+        ok: true,
+        affectedRows: Number(result && result.affectedRows) || 0,
+    };
+}
+
+async function pruneReportLogs(accountId, options = {}) {
+    const pool = getPool();
+    if (!pool) return { ok: false, affectedRows: 0 };
+    const normalizedAccountId = String(accountId || '').trim();
+    if (!normalizedAccountId) return { ok: false, affectedRows: 0 };
+    const opts = (options && typeof options === 'object') ? options : { retentionDays: options };
+    const parsedRetentionDays = Number.parseInt(opts.retentionDays, 10);
+    const retentionDays = Math.max(0, Math.min(365, Number.isFinite(parsedRetentionDays) ? parsedRetentionDays : 30));
+    if (retentionDays <= 0) {
+        return { ok: true, affectedRows: 0, retentionDays };
+    }
+    const [result] = await pool.execute(
+        `DELETE FROM report_logs
+         WHERE account_id = ?
+           AND created_at < DATE_SUB(NOW(), INTERVAL ${retentionDays} DAY)`,
+        [normalizedAccountId],
+    );
+    return {
+        ok: true,
+        affectedRows: Number(result && result.affectedRows) || 0,
+        retentionDays,
+    };
+}
+
 module.exports = {
     initDatabase,
     getDb,
@@ -262,4 +457,10 @@ module.exports = {
     saveAnnouncement,
     deleteAnnouncement,
     invalidateAnnouncementCache,
+    insertReportLog,
+    getReportLogs,
+    exportReportLogs,
+    deleteReportLogsByIds,
+    clearReportLogs,
+    pruneReportLogs,
 };

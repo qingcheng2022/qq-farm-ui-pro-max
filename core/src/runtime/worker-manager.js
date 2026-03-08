@@ -55,6 +55,14 @@ function createWorkerManager(options) {
         return /[a-z]/i.test(String(uin || '').trim());
     }
 
+    function isWechatAutoRefreshEnabled() {
+        const thirdPartyCfg = store.getThirdPartyApiConfig ? store.getThirdPartyApiConfig() : {};
+        const raw = thirdPartyCfg.wechatAutoRefreshAuth ?? processRef.env.WECHAT_AUTO_REFRESH_AUTH ?? '';
+        if (typeof raw === 'boolean') return raw;
+        const text = String(raw || '').trim().toLowerCase();
+        return text === '1' || text === 'true' || text === 'yes' || text === 'on';
+    }
+
     async function refreshQQAuthCode(account) {
         const platform = String(account && account.platform || '').trim();
         const ticket = String(account && account.authTicket || '').trim();
@@ -163,6 +171,28 @@ function createWorkerManager(options) {
                 }
             } catch (error) {
                 log('系统', `账号 ${launchAccount.name} QQ 启动换码失败，回退使用现有 Code`, {
+                    accountId: String(launchAccount.id),
+                    accountName: launchAccount.name,
+                    reason: error && error.message ? error.message : String(error || ''),
+                });
+            }
+        }
+
+        if (isWechatAutoRefreshEnabled() && isWechatPlatform(String(launchAccount.platform || '')) && looksLikeWxId(launchAccount.uin)) {
+            try {
+                const refreshedAccount = await refreshWechatAuthCode(launchAccount);
+                if (refreshedAccount.code && refreshedAccount.code !== launchAccount.code) {
+                    launchAccount = refreshedAccount;
+                    addOrUpdateAccount({
+                        id: launchAccount.id,
+                        code: launchAccount.code,
+                        uin: launchAccount.uin,
+                        qq: launchAccount.qq || '',
+                    });
+                    addAccountLog('auth_refresh', `账号 ${launchAccount.name} 启动前自动刷新微信授权成功`, launchAccount.id, launchAccount.name);
+                }
+            } catch (error) {
+                log('系统', `账号 ${launchAccount.name} 微信启动续签失败，回退使用现有 Code`, {
                     accountId: String(launchAccount.id),
                     accountName: launchAccount.name,
                     reason: error && error.message ? error.message : String(error || ''),
@@ -448,7 +478,7 @@ function createWorkerManager(options) {
             } catch { }
             if (code === 400) {
                 const accountSnapshot = worker.account ? { ...worker.account, id: accountId, name: worker.name } : null;
-                if (accountSnapshot && isWechatPlatform(accountSnapshot.platform) && looksLikeWxId(accountSnapshot.uin) && !worker.authRefreshing) {
+                if (accountSnapshot && isWechatAutoRefreshEnabled() && isWechatPlatform(accountSnapshot.platform) && looksLikeWxId(accountSnapshot.uin) && !worker.authRefreshing) {
                     worker.authRefreshing = true;
                     log('系统', `账号 ${worker.name} 微信授权已失效，尝试自动续签...`, {
                         accountId: String(accountId),
