@@ -16,6 +16,7 @@ import { useFarmToolsStore } from '@/stores/farmTools'
 import { useStatusStore } from '@/stores/status'
 
 import { useAvatar } from '@/utils/avatar'
+import { hydrateServerBackedStringPreference, normalizeNotificationLastReadDate } from '@/utils/view-preferences'
 
 const { getAvatarUrl, markFailed } = useAvatar()
 
@@ -28,6 +29,7 @@ const { status, realtimeConnected } = storeToRefs(statusStore)
 const { sidebarOpen } = storeToRefs(appStore)
 const farmToolsStore = useFarmToolsStore()
 const { isAvailable: isFarmToolsAvailable } = storeToRefs(farmToolsStore)
+const ACCOUNT_SELECTION_BROWSER_PREF_NOTE = '当前账号选择会跟随当前登录账号同步到服务器；如果网络异常，本机仍会先用本地缓存兜底。'
 
 // 响应式检测是否为宽屏（xl 断点 ≥ 1280px）
 const isDesktop = useMediaQuery('(min-width: 1280px)')
@@ -141,8 +143,9 @@ function openRemarkModal(acc: any) {
   showAccountDropdown.value = false
 }
 
-onMounted(() => {
-  accountStore.fetchAccounts()
+onMounted(async () => {
+  await appStore.fetchUIConfig()
+  await accountStore.fetchAccounts()
   checkConnection()
   loadCurrentUser()
   checkUnread()
@@ -241,7 +244,7 @@ const connectionStatus = computed(() => {
   if (!currentAccount.value?.id) {
     return {
       text: '请添加账号',
-      color: 'bg-gray-400',
+      color: 'status-dot-muted',
       pulse: false,
     }
   }
@@ -257,7 +260,7 @@ const connectionStatus = computed(() => {
 
   return {
     text: '未连接',
-    color: 'bg-gray-400', // Or red? Old version uses gray/offline class which is gray usually
+    color: 'status-dot-muted', // muted by design token
     pulse: false,
   }
 })
@@ -300,10 +303,16 @@ if (typeof window !== 'undefined') {
  */
 async function checkUnread() {
   try {
-    const res = await api.get('/api/notifications', { params: { limit: 1 } })
+    const [res, lastRead] = await Promise.all([
+      api.get('/api/notifications', { params: { limit: 1 } }),
+      hydrateServerBackedStringPreference({
+        payloadKey: 'notificationLastReadDate',
+        localKey: 'last_read_notification_date',
+        normalize: normalizeNotificationLastReadDate,
+      }),
+    ])
     if (res.data.ok && res.data.data?.length > 0) {
       const latestDate = res.data.data[0].date
-      const lastRead = localStorage.getItem('last_read_notification_date') || ''
       hasUnread.value = latestDate !== lastRead
     }
   }
@@ -353,19 +362,22 @@ function onNavClick() {
     appStore.closeSidebar()
   }
 }
+
+const supportQqGroup = computed(() => appStore.supportQqGroup)
+const copyrightText = computed(() => appStore.copyrightText)
 </script>
 
 <template>
   <aside
-    class="glass-panel fixed inset-y-0 left-0 z-50 h-full w-64 flex flex-col border-r border-gray-200/50 transition-transform duration-300 xl:static dark:border-gray-700/50"
+    class="sidebar-shell glass-panel fixed inset-y-0 left-0 z-50 h-full w-64 flex flex-col border-r transition-transform duration-300 xl:static"
     :style="{ transform: sidebarTransform }"
   >
     <!-- Brand -->
-    <div class="h-16 flex items-center justify-between border-b border-gray-100 px-4 dark:border-gray-700/50">
+    <div class="sidebar-brand h-16 flex items-center justify-between border-b px-4">
       <div class="flex items-center gap-2">
         <!-- 窄屏关闭按钮 (移至最左侧) -->
         <button
-          class="flex items-center justify-center gap-1 rounded-lg px-2 py-1.5 text-gray-500 xl:hidden hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700"
+          class="sidebar-ghost-btn flex items-center justify-center gap-1 rounded-lg px-2 py-1.5 xl:hidden"
           @click="appStore.closeSidebar"
         >
           <div class="i-carbon-close text-lg" />
@@ -374,9 +386,9 @@ function onNavClick() {
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" class="h-7 w-7 xl:ml-2">
           <defs>
             <linearGradient id="sidebarGrad" x1="0" y1="1" x2="0.3" y2="0">
-              <stop offset="0%" stop-color="#15803d" />
-              <stop offset="60%" stop-color="#22c55e" />
-              <stop offset="100%" stop-color="#4ade80" />
+              <stop offset="0%" stop-color="var(--ui-status-success)" />
+              <stop offset="60%" stop-color="var(--ui-status-success)" />
+              <stop offset="100%" stop-color="var(--ui-status-success)" stop-opacity="0.7" />
             </linearGradient>
           </defs>
           <path fill="url(#sidebarGrad)" d="M576 96c0 108.1-76.6 198.3-178.4 219.4c-7.9-58.1-34-110.4-72.5-150.9C365.2 104 433.9 64 512 64h32c17.7 0 32 14.3 32 32M64 160c0-17.7 14.3-32 32-32h32c123.7 0 224 100.3 224 224v192c0 17.7-14.3 32-32 32s-32-14.3-32-32V384C164.3 384 64 283.7 64 160" />
@@ -393,69 +405,72 @@ function onNavClick() {
       <div class="w-8 xl:hidden" />
     </div>
     <!-- Account Selector -->
-    <div class="border-b border-gray-100 p-4 dark:border-gray-700/50">
+    <div class="sidebar-account border-b p-4">
       <div class="group relative">
         <button
-          class="w-full flex items-center justify-between border border-transparent rounded-xl bg-black/5 px-4 py-2.5 outline-none backdrop-blur-sm transition-all duration-200 hover:border-black/10 dark:bg-black/20 hover:bg-black/10 focus:ring-2 focus:ring-primary-500/20 dark:hover:border-white/20 dark:hover:bg-black/40"
+          class="sidebar-account-trigger w-full flex items-center justify-between border rounded-xl px-4 py-2.5 outline-none backdrop-blur-sm transition-all duration-200"
           @click="showAccountDropdown = !showAccountDropdown"
         >
           <div class="flex items-center gap-3 overflow-hidden">
-            <div class="h-8 w-8 flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-gray-200 ring-2 ring-white dark:bg-gray-600 dark:ring-gray-700">
+            <div class="sidebar-avatar-shell h-8 w-8 flex shrink-0 items-center justify-center overflow-hidden rounded-full">
               <img
                 v-if="currentAccount && getAvatarUrl(currentAccount)"
                 :src="getAvatarUrl(currentAccount)"
                 class="h-full w-full object-cover"
                 @error="(e) => markFailed((e.target as HTMLImageElement).src)"
               >
-              <div v-else class="i-carbon-user text-gray-400" />
+              <div v-else class="i-carbon-user glass-text-muted" />
             </div>
             <div class="min-w-0 flex flex-col items-start">
               <span class="w-full truncate text-left text-sm font-medium">
                 {{ displayName }}
               </span>
-              <span class="w-full truncate text-left text-xs text-gray-400">
+              <span class="glass-text-muted w-full truncate text-left text-xs">
                 {{ currentAccount?.uin || currentAccount?.id || '未选择' }}
               </span>
             </div>
           </div>
           <div
-            class="i-carbon-chevron-down text-gray-400 transition-transform duration-200"
+            class="i-carbon-chevron-down glass-text-muted transition-transform duration-200"
             :class="{ 'rotate-180': showAccountDropdown }"
           />
         </button>
+        <p class="mt-2 px-1 text-[11px] text-sky-600 leading-5 dark:text-sky-300">
+          {{ ACCOUNT_SELECTION_BROWSER_PREF_NOTE }}
+        </p>
 
         <!-- Dropdown Menu -->
         <div
           v-if="showAccountDropdown"
-          class="glass-panel absolute left-0 right-0 top-full z-50 mt-2 overflow-hidden border border-gray-200/50 rounded-xl py-1 shadow-xl dark:border-white/10"
+          class="sidebar-account-menu glass-panel absolute left-0 right-0 top-full z-50 mt-2 overflow-hidden border rounded-xl py-1 shadow-xl"
         >
           <div class="custom-scrollbar max-h-60 overflow-y-auto">
             <template v-if="accounts.length > 0">
               <button
                 v-for="acc in accounts"
                 :key="acc.id || acc.uin"
-                class="w-full flex items-center gap-3 px-4 py-2 transition-colors hover:bg-black/5 dark:hover:bg-white/10"
+                class="sidebar-dropdown-item w-full flex items-center gap-3 px-4 py-2 transition-colors"
                 :class="{ 'bg-primary-50/50 dark:bg-primary-500/20': currentAccount?.id === acc.id }"
                 @click="selectAccount(acc)"
               >
-                <div class="h-6 w-6 flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-gray-200 dark:bg-gray-600">
+                <div class="sidebar-dropdown-avatar h-6 w-6 flex shrink-0 items-center justify-center overflow-hidden rounded-full">
                   <img
                     v-if="getAvatarUrl(acc)"
                     :src="getAvatarUrl(acc)"
                     class="h-full w-full object-cover"
                     @error="(e) => markFailed((e.target as HTMLImageElement).src)"
                   >
-                  <div v-else class="i-carbon-user text-gray-400" />
+                  <div v-else class="i-carbon-user glass-text-muted" />
                 </div>
                 <div class="min-w-0 flex flex-1 flex-col items-start">
                   <span class="w-full truncate text-left text-sm font-medium">
                     {{ acc.name || acc.nick || acc.uin }}
                   </span>
-                  <span class="text-xs text-gray-400">{{ acc.uin || acc.id }}</span>
+                  <span class="glass-text-muted text-xs">{{ acc.uin || acc.id }}</span>
                 </div>
                 <div class="flex items-center gap-1">
                   <button
-                    class="rounded-full p-1 text-gray-400 transition-colors hover:bg-blue-50 hover:text-blue-500 dark:hover:bg-blue-900/20"
+                    class="glass-text-muted rounded-full p-1 transition-colors hover:bg-blue-50 hover:text-blue-500 dark:hover:bg-blue-900/20"
                     title="修改备注"
                     @click.stop="openRemarkModal(acc)"
                   >
@@ -465,13 +480,13 @@ function onNavClick() {
                 </div>
               </button>
             </template>
-            <div v-else class="px-4 py-3 text-center text-sm text-gray-400">
+            <div v-else class="glass-text-muted px-4 py-3 text-center text-sm">
               暂无账号
             </div>
           </div>
-          <div class="mt-1 border-t border-gray-100 pt-1 dark:border-gray-700">
+          <div class="sidebar-account-menu-footer mt-1 border-t pt-1">
             <button
-              class="w-full flex items-center gap-2 px-4 py-2 text-sm text-primary-600 transition-colors hover:bg-gray-50 dark:text-primary-400 dark:hover:bg-gray-700/50"
+              class="sidebar-account-action w-full flex items-center gap-2 px-4 py-2 text-sm transition-colors"
               @click="showAccountModal = true; showAccountDropdown = false"
             >
               <div class="i-carbon-add" />
@@ -479,7 +494,7 @@ function onNavClick() {
             </button>
             <router-link
               to="/accounts"
-              class="w-full flex items-center gap-2 px-4 py-2 text-sm text-primary-600 transition-colors hover:bg-gray-50 dark:text-primary-400 dark:hover:bg-gray-700/50"
+              class="sidebar-account-action w-full flex items-center gap-2 px-4 py-2 text-sm transition-colors"
               @click="showAccountDropdown = false"
             >
               <div class="i-carbon-add-alt" />
@@ -496,7 +511,7 @@ function onNavClick() {
         v-for="item in navItems"
         :key="item.path"
         :to="item.path"
-        class="group flex items-center gap-3 rounded-lg px-3 py-2.5 text-gray-600 transition-all duration-200 hover:bg-gray-50 dark:text-gray-400 hover:text-primary-600 dark:hover:bg-gray-700/50 dark:hover:text-primary-400"
+        class="sidebar-nav-link group flex items-center gap-3 rounded-lg px-3 py-2.5 transition-all duration-200"
         :active-class="item.path === '/' ? '' : 'bg-primary-50 dark:bg-primary-900/10 text-primary-600 dark:text-primary-400 font-medium shadow-sm ring-1 ring-primary-500/10'"
         :exact-active-class="item.path === '/' ? 'bg-primary-50 dark:bg-primary-900/10 text-primary-600 dark:text-primary-400 font-medium shadow-sm ring-1 ring-primary-500/10' : ''"
         @click="onNavClick"
@@ -509,7 +524,7 @@ function onNavClick() {
     <!-- 通知入口按钮 -->
     <div class="px-3 pb-2">
       <button
-        class="w-full flex items-center gap-3 rounded-lg px-3 py-2.5 text-gray-600 transition-all duration-200 hover:bg-amber-50 dark:text-gray-400 hover:text-amber-600 dark:hover:bg-amber-900/10 dark:hover:text-amber-400"
+        class="sidebar-entry-btn sidebar-entry-btn--notice w-full flex items-center gap-3 rounded-lg px-3 py-2.5 transition-all duration-200"
         @click="() => { onNavClick(); openNotifications(); }"
       >
         <div class="relative">
@@ -527,7 +542,7 @@ function onNavClick() {
     <div v-if="isFarmToolsAvailable" class="px-3 pb-2">
       <router-link
         to="/farm-tools"
-        class="w-full flex items-center gap-3 rounded-lg px-3 py-2.5 text-gray-600 transition-all duration-200 hover:bg-emerald-50 dark:text-gray-400 hover:text-emerald-600 dark:hover:bg-emerald-900/10 dark:hover:text-emerald-400"
+        class="sidebar-entry-btn sidebar-entry-btn--farm w-full flex items-center gap-3 rounded-lg px-3 py-2.5 transition-all duration-200"
         active-class="bg-emerald-50 dark:bg-emerald-900/10 text-emerald-600 dark:text-emerald-400 font-medium shadow-sm ring-1 ring-emerald-500/10"
         @click="onNavClick"
       >
@@ -540,7 +555,7 @@ function onNavClick() {
     <div class="px-3 pb-2">
       <router-link
         to="/help"
-        class="w-full flex items-center gap-3 rounded-lg px-3 py-2.5 text-gray-600 transition-all duration-200 hover:bg-blue-50 dark:text-gray-400 hover:text-blue-600 dark:hover:bg-blue-900/10 dark:hover:text-blue-400"
+        class="sidebar-entry-btn sidebar-entry-btn--help w-full flex items-center gap-3 rounded-lg px-3 py-2.5 transition-all duration-200"
         @click="onNavClick"
       >
         <div class="i-carbon-book text-xl" />
@@ -549,7 +564,7 @@ function onNavClick() {
     </div>
 
     <!-- Footer Status -->
-    <div class="mt-auto border-t border-gray-200/50 bg-black/5 p-4 dark:border-white/10 dark:bg-black/20">
+    <div class="sidebar-footer mt-auto border-t p-4">
       <div class="glass-text-muted mb-2 flex items-center justify-between text-xs">
         <div class="flex items-center gap-1.5">
           <div
@@ -563,7 +578,7 @@ function onNavClick() {
           <ThemeToggle />
         </div>
       </div>
-      <div class="mt-1 flex flex-col gap-0.5 text-xs text-gray-400 font-mono">
+      <div class="sidebar-footer-meta mt-1 flex flex-col gap-0.5 text-xs font-mono">
         <div class="flex items-center justify-between">
           <span>{{ formattedTime }}</span>
         </div>
@@ -572,9 +587,9 @@ function onNavClick() {
           <span v-if="serverVersion">Core v{{ serverVersion }}</span>
         </div>
         <!-- 侧栏微缩防伪水印 -->
-        <div class="pointer-events-none mt-1.5 flex select-none items-center justify-between border-t border-gray-200/50 pt-1.5 text-[10px] text-gray-400/80 dark:border-gray-700/50">
-          <span>Made by smdk000</span>
-          <span>QQ群: 227916149</span>
+        <div class="sidebar-watermark pointer-events-none mt-1.5 flex select-none items-center justify-between border-t pt-1.5 text-[10px]">
+          <span>{{ copyrightText }}</span>
+          <span>QQ群: {{ supportQqGroup }}</span>
         </div>
       </div>
     </div>
@@ -615,10 +630,127 @@ function onNavClick() {
   background: transparent;
 }
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  background-color: rgba(156, 163, 175, 0.3);
+  background-color: var(--ui-scrollbar-thumb);
   border-radius: 2px;
 }
 .custom-scrollbar:hover::-webkit-scrollbar-thumb {
-  background-color: rgba(156, 163, 175, 0.5);
+  background-color: var(--ui-scrollbar-thumb-hover);
+}
+
+.sidebar-shell {
+  border-color: var(--ui-border-subtle);
+}
+
+.sidebar-brand,
+.sidebar-account {
+  border-color: var(--ui-border-subtle);
+}
+
+.sidebar-ghost-btn {
+  color: var(--ui-text-2);
+}
+
+.sidebar-ghost-btn:hover {
+  background: var(--ui-bg-surface);
+  color: var(--ui-text-1);
+}
+
+.sidebar-account-trigger {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--ui-bg-surface) 60%, transparent);
+}
+
+.sidebar-account-trigger:hover {
+  border-color: var(--ui-border-subtle);
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 72%, transparent);
+}
+
+.sidebar-account-menu {
+  border-color: var(--ui-border-subtle);
+}
+
+.sidebar-dropdown-item:hover {
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 72%, transparent);
+}
+
+.sidebar-account-menu-footer {
+  border-color: var(--ui-border-subtle);
+}
+
+.sidebar-account-action {
+  color: var(--ui-text-1);
+}
+
+.sidebar-account-action:hover {
+  background: var(--ui-bg-surface);
+}
+
+.sidebar-nav-link {
+  color: var(--ui-text-2);
+}
+
+.sidebar-nav-link:hover {
+  background: var(--ui-bg-surface);
+  color: var(--ui-text-1);
+}
+
+.sidebar-entry-btn {
+  color: var(--ui-text-2);
+}
+
+.sidebar-entry-btn:hover {
+  background: var(--ui-bg-surface);
+}
+
+.sidebar-entry-btn--notice:hover {
+  color: var(--ui-status-warning);
+}
+.sidebar-entry-btn--farm:hover {
+  color: var(--ui-status-success);
+}
+.sidebar-entry-btn--help:hover {
+  color: var(--ui-status-info);
+}
+
+.sidebar-footer {
+  border-color: var(--ui-border-subtle);
+  background: color-mix(in srgb, var(--ui-bg-surface) 60%, transparent);
+}
+
+.sidebar-footer-meta {
+  color: var(--ui-text-3);
+}
+
+.sidebar-watermark {
+  border-color: var(--ui-border-subtle);
+  color: color-mix(in srgb, var(--ui-text-3) 80%, transparent);
+}
+
+.status-dot-muted {
+  background-color: var(--ui-text-3);
+}
+
+.sidebar-shell
+  :is(
+    [class*='text-'][class*='gray-400'],
+    [class*='text-'][class*='gray-500'],
+    [class*='dark:text-'][class*='gray-400']
+  ) {
+  color: var(--ui-text-2) !important;
+}
+
+.sidebar-avatar-shell,
+.sidebar-dropdown-avatar {
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 88%, transparent) !important;
+  border: 1px solid var(--ui-border-subtle) !important;
+}
+
+.sidebar-shell [class*='hover:bg-blue-50'],
+.sidebar-shell [class*='dark:hover:bg-blue-900/20'] {
+  background: color-mix(in srgb, var(--ui-brand-500) 12%, transparent) !important;
+}
+
+.sidebar-shell [class*='hover:text-blue-500'] {
+  color: var(--ui-brand-600) !important;
 }
 </style>

@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS `user_preferences` (
+    `id` INT NOT NULL AUTO_INCREMENT,
+    `user_id` INT NOT NULL,
+    `current_account_id` VARCHAR(128) COLLATE utf8mb4_unicode_ci DEFAULT '',
+    `announcement_dismissed_id` VARCHAR(32) COLLATE utf8mb4_unicode_ci DEFAULT '',
+    `notification_last_read_date` VARCHAR(32) COLLATE utf8mb4_unicode_ci DEFAULT '',
+    `app_seen_version` VARCHAR(64) COLLATE utf8mb4_unicode_ci DEFAULT '',
+    `accounts_view_state` JSON DEFAULT NULL,
+    `accounts_action_history` JSON DEFAULT NULL,
+    `dashboard_view_state` JSON DEFAULT NULL,
+    `analytics_view_state` JSON DEFAULT NULL,
+    `report_history_view_state` JSON DEFAULT NULL,
+    `cards_view_state` JSON DEFAULT NULL,
+    `system_logs_view_state` JSON DEFAULT NULL,
+    `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_user_preferences_user_id` (`user_id`),
+    CONSTRAINT `user_preferences_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci;

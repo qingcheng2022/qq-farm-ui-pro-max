@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { AccountsActionHistoryItem, AccountsActionHistoryStatus } from '@/utils/view-preferences'
 import { useIntervalFn } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
 import { computed, onMounted, ref, watch } from 'vue'
@@ -6,13 +7,30 @@ import { useRoute, useRouter } from 'vue-router'
 import api from '@/api'
 import AccountModal from '@/components/AccountModal.vue'
 import ConfirmModal from '@/components/ConfirmModal.vue'
+import BaseAccountViewSwitcherLayout from '@/components/ui/BaseAccountViewSwitcherLayout.vue'
+import BaseBadge from '@/components/ui/BaseBadge.vue'
+import BaseBulkActions from '@/components/ui/BaseBulkActions.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
+import BaseDataTable from '@/components/ui/BaseDataTable.vue'
+import BaseDataTableHead from '@/components/ui/BaseDataTableHead.vue'
+import BaseEmptyState from '@/components/ui/BaseEmptyState.vue'
+import BaseFilterChip from '@/components/ui/BaseFilterChip.vue'
+import BaseFilterChips from '@/components/ui/BaseFilterChips.vue'
+import BaseHistorySummaryPanel from '@/components/ui/BaseHistorySummaryPanel.vue'
+import BaseIconAction from '@/components/ui/BaseIconAction.vue'
 import BaseInput from '@/components/ui/BaseInput.vue'
+import BaseManagementBar from '@/components/ui/BaseManagementBar.vue'
+import BaseSectionHeader from '@/components/ui/BaseSectionHeader.vue'
 import BaseSelect from '@/components/ui/BaseSelect.vue'
+import BaseSelectionSummary from '@/components/ui/BaseSelectionSummary.vue'
+import BaseSortableHeaderCell from '@/components/ui/BaseSortableHeaderCell.vue'
+import BaseTableToolbar from '@/components/ui/BaseTableToolbar.vue'
+import { useViewPreferenceSync } from '@/composables/use-view-preference-sync'
 import { useAccountStore } from '@/stores/account'
 import { useToastStore } from '@/stores/toast'
 import { adminToken } from '@/utils/auth'
 import { useAvatar } from '@/utils/avatar'
+import { DEFAULT_ACCOUNTS_VIEW_STATE, fetchViewPreferences, normalizeAccountsActionHistory, normalizeAccountsViewState } from '@/utils/view-preferences'
 
 interface CurrentUser {
   username?: string
@@ -33,21 +51,8 @@ type ViewMode = 'standard' | 'compact' | 'table'
 type TableSortKey = 'account' | 'owner' | 'platform' | 'activity' | 'mode' | 'state'
 type SortDirection = 'asc' | 'desc'
 type TableColumnKey = 'owner' | 'platform' | 'activity' | 'mode' | 'state' | 'actions'
-type ActionHistoryStatus = 'success' | 'warning' | 'error'
-
-interface ActionHistoryItem {
-  id: string
-  actionLabel: string
-  status: ActionHistoryStatus
-  timestamp: number
-  totalCount: number
-  successCount: number
-  failedCount: number
-  skippedCount: number
-  affectedNames: string[]
-  failedNames: string[]
-  targetLabel?: string
-}
+type ActionHistoryItem = AccountsActionHistoryItem
+type ActionHistoryStatus = AccountsActionHistoryStatus
 
 const VIEW_MODE_STORAGE_KEY = 'accounts_view_mode'
 const TABLE_SORT_STORAGE_KEY = 'accounts_table_sort'
@@ -55,6 +60,10 @@ const TABLE_COLUMNS_STORAGE_KEY = 'accounts_table_columns'
 const ACTION_HISTORY_STORAGE_KEY = 'accounts_action_history'
 const ACTION_HISTORY_LIMIT = 8
 const UNOWNED_TRANSFER_VALUE = '__unowned__'
+const ACCOUNT_VIEW_PREFERENCES_NOTE = '视图模式、表格排序、列显隐和最近操作摘要会跟随当前登录用户同步到服务器；本机缓存只作首屏兜底。'
+const ACTION_HISTORY_SYNC_NOTE = '这里展示的是当前登录用户最近的批量操作摘要，会同步到服务器并在新设备恢复；它不是正式审计日志。'
+const TABLE_VIEW_SYNC_NOTE = '列设置 / 排序会跟随当前登录用户同步到服务器'
+const TABLE_COLUMN_SYNC_NOTE = '当前列设置会同步到服务器；最近操作摘要也会跟随当前登录用户同步。'
 
 const { getAvatarUrl, markFailed } = useAvatar()
 
@@ -163,6 +172,14 @@ function readViewMode(): ViewMode {
   return 'standard'
 }
 
+function persistViewMode(mode: ViewMode = viewMode.value) {
+  try {
+    localStorage.setItem(VIEW_MODE_STORAGE_KEY, mode)
+  }
+  catch {
+  }
+}
+
 function normalizeOwnershipFilter(value: unknown): OwnershipFilter {
   const raw = String(value || '').trim()
   if (raw === 'mine' || raw === 'other_user' || raw === 'other_admin' || raw === 'unowned')
@@ -217,22 +234,22 @@ function getQueryValue(value: unknown) {
 
 function setViewMode(mode: ViewMode) {
   viewMode.value = mode
-  try {
-    localStorage.setItem(VIEW_MODE_STORAGE_KEY, mode)
-  }
-  catch {
-  }
+  persistViewMode(mode)
 }
 
 function readTableSortState() {
   try {
     const raw = JSON.parse(localStorage.getItem(TABLE_SORT_STORAGE_KEY) || '{}')
-    tableSortKey.value = normalizeTableSortKey(raw.key)
-    tableSortDirection.value = normalizeSortDirection(raw.direction)
+    return {
+      key: normalizeTableSortKey(raw.key),
+      direction: normalizeSortDirection(raw.direction),
+    }
   }
   catch {
-    tableSortKey.value = 'activity'
-    tableSortDirection.value = 'desc'
+    return {
+      key: 'activity' as TableSortKey,
+      direction: 'desc' as SortDirection,
+    }
   }
 }
 
@@ -251,7 +268,7 @@ function readTableColumnVisibility() {
   try {
     const raw = JSON.parse(localStorage.getItem(TABLE_COLUMNS_STORAGE_KEY) || '{}')
     if (raw && typeof raw === 'object') {
-      tableColumnVisibility.value = {
+      return {
         owner: raw.owner !== false,
         platform: raw.platform !== false,
         activity: raw.activity !== false,
@@ -263,6 +280,14 @@ function readTableColumnVisibility() {
   }
   catch {
   }
+  return {
+    owner: true,
+    platform: true,
+    activity: true,
+    mode: true,
+    state: true,
+    actions: true,
+  }
 }
 
 function persistTableColumnVisibility() {
@@ -273,6 +298,40 @@ function persistTableColumnVisibility() {
   }
 }
 
+function buildLocalAccountsViewState() {
+  const tableSortState = readTableSortState()
+  return normalizeAccountsViewState({
+    viewMode: readViewMode(),
+    tableSortKey: tableSortState.key,
+    tableSortDirection: tableSortState.direction,
+    tableColumnVisibility: readTableColumnVisibility(),
+  }, DEFAULT_ACCOUNTS_VIEW_STATE)
+}
+
+function buildAccountsViewState() {
+  return normalizeAccountsViewState({
+    viewMode: viewMode.value,
+    tableSortKey: tableSortKey.value,
+    tableSortDirection: tableSortDirection.value,
+    tableColumnVisibility: tableColumnVisibility.value,
+  }, DEFAULT_ACCOUNTS_VIEW_STATE)
+}
+
+function persistAccountsViewStateToLocal() {
+  persistViewMode(viewMode.value)
+  persistTableSortState()
+  persistTableColumnVisibility()
+}
+
+function applyAccountsViewState(state: Partial<typeof DEFAULT_ACCOUNTS_VIEW_STATE> | null | undefined) {
+  const normalized = normalizeAccountsViewState(state, DEFAULT_ACCOUNTS_VIEW_STATE)
+  viewMode.value = normalized.viewMode
+  tableSortKey.value = normalized.tableSortKey
+  tableSortDirection.value = normalized.tableSortDirection
+  tableColumnVisibility.value = { ...normalized.tableColumnVisibility }
+  persistAccountsViewStateToLocal()
+}
+
 function toggleTableColumn(key: TableColumnKey) {
   tableColumnVisibility.value = {
     ...tableColumnVisibility.value,
@@ -281,43 +340,70 @@ function toggleTableColumn(key: TableColumnKey) {
   persistTableColumnVisibility()
 }
 
-function readActionHistory() {
+function readActionHistoryFromLocal() {
   try {
     const raw = JSON.parse(localStorage.getItem(ACTION_HISTORY_STORAGE_KEY) || '[]')
-    if (!Array.isArray(raw)) {
-      actionHistory.value = []
-      return
-    }
-    actionHistory.value = raw
-      .filter(item => item && typeof item === 'object')
-      .map((item: any) => ({
-        id: String(item.id || `${item.actionLabel || 'history'}-${item.timestamp || Date.now()}`),
-        actionLabel: String(item.actionLabel || '批量操作'),
-        status: item.status === 'success' || item.status === 'error' ? item.status : 'warning',
-        timestamp: Number(item.timestamp || 0),
-        totalCount: Number(item.totalCount || 0),
-        successCount: Number(item.successCount || 0),
-        failedCount: Number(item.failedCount || 0),
-        skippedCount: Number(item.skippedCount || 0),
-        affectedNames: Array.isArray(item.affectedNames) ? item.affectedNames.map((name: unknown) => String(name || '')).filter(Boolean) : [],
-        failedNames: Array.isArray(item.failedNames) ? item.failedNames.map((name: unknown) => String(name || '')).filter(Boolean) : [],
-        targetLabel: String(item.targetLabel || '').trim() || undefined,
-      }))
-      .filter(item => item.timestamp > 0)
-      .sort((a, b) => b.timestamp - a.timestamp)
-      .slice(0, ACTION_HISTORY_LIMIT)
+    return normalizeAccountsActionHistory(Array.isArray(raw) ? raw : [], [])
   }
   catch {
-    actionHistory.value = []
+    return []
   }
+}
+
+function buildAccountsActionHistory() {
+  return normalizeAccountsActionHistory(actionHistory.value, [])
 }
 
 function persistActionHistory() {
   try {
-    localStorage.setItem(ACTION_HISTORY_STORAGE_KEY, JSON.stringify(actionHistory.value))
+    localStorage.setItem(ACTION_HISTORY_STORAGE_KEY, JSON.stringify(buildAccountsActionHistory()))
   }
   catch {
   }
+}
+
+function applyAccountsActionHistory(history: Partial<ActionHistoryItem>[] | null | undefined) {
+  actionHistory.value = normalizeAccountsActionHistory(history, [])
+  persistActionHistory()
+}
+
+const {
+  hydrate: hydrateAccountsViewState,
+  enableSync: enableAccountsViewSync,
+} = useViewPreferenceSync({
+  key: 'accountsViewState',
+  label: '账号页视图偏好',
+  buildState: buildAccountsViewState,
+  applyState: applyAccountsViewState,
+  defaultState: DEFAULT_ACCOUNTS_VIEW_STATE,
+  readLocalFallback: buildLocalAccountsViewState,
+})
+
+const {
+  hydrate: hydrateAccountsActionHistory,
+  enableSync: enableAccountsActionHistorySync,
+} = useViewPreferenceSync({
+  key: 'accountsActionHistory',
+  label: '账号页最近操作摘要',
+  buildState: buildAccountsActionHistory,
+  applyState: applyAccountsActionHistory,
+  defaultState: [],
+  readLocalFallback: readActionHistoryFromLocal,
+  shouldSyncFallback: history => history.length > 0,
+})
+
+async function hydrateAccountsPagePreferences() {
+  let payload = null
+  try {
+    payload = await fetchViewPreferences()
+  }
+  catch (error) {
+    console.warn('读取账号页偏好失败', error)
+  }
+  await Promise.all([
+    hydrateAccountsViewState(payload),
+    hydrateAccountsActionHistory(payload),
+  ])
 }
 
 function resolveActionHistoryStatus(successCount: number, failedCount: number, skippedCount: number): ActionHistoryStatus {
@@ -601,7 +687,7 @@ function resolveOwnerMeta(acc: any) {
       section: 'unowned' as OwnershipSection,
       label: '未归属 / 系统账号',
       badge: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200',
-      tabActive: 'border-slate-300/70 bg-slate-500/15 text-slate-100 shadow-[0_8px_30px_rgba(148,163,184,0.2)]',
+      tabActive: 'accounts-tab-active border-slate-300/70 bg-slate-500/15 text-slate-100',
       tabIdle: 'border-slate-400/20 bg-black/10 text-slate-300/80 hover:bg-slate-500/10',
       cardGlow: 'hover:border-slate-300/35',
       shortLabel: '未归属',
@@ -613,7 +699,7 @@ function resolveOwnerMeta(acc: any) {
       section: 'mine' as OwnershipSection,
       label: '我自己登录的账号',
       badge: 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300',
-      tabActive: 'border-primary-400/50 bg-primary-500/18 text-primary-50 shadow-[0_8px_30px_rgba(34,197,94,0.2)]',
+      tabActive: 'accounts-tab-active border-primary-400/50 bg-primary-500/18 text-primary-50',
       tabIdle: 'border-primary-500/20 bg-black/10 text-primary-200/85 hover:bg-primary-500/10',
       cardGlow: 'hover:border-primary-400/35',
       shortLabel: '我自己',
@@ -625,7 +711,7 @@ function resolveOwnerMeta(acc: any) {
       section: 'other_admin' as OwnershipSection,
       label: `其他管理员账号: ${owner}`,
       badge: 'bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300',
-      tabActive: 'border-violet-400/45 bg-violet-500/16 text-violet-50 shadow-[0_8px_30px_rgba(167,139,250,0.2)]',
+      tabActive: 'accounts-tab-active border-violet-400/45 bg-violet-500/16 text-violet-50',
       tabIdle: 'border-violet-500/20 bg-black/10 text-violet-200/85 hover:bg-violet-500/10',
       cardGlow: 'hover:border-violet-400/35',
       shortLabel: '其他管理员',
@@ -636,7 +722,7 @@ function resolveOwnerMeta(acc: any) {
     section: 'other_user' as OwnershipSection,
     label: `普通用户账号: ${owner}`,
     badge: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
-    tabActive: 'border-amber-400/45 bg-amber-500/16 text-amber-50 shadow-[0_8px_30px_rgba(245,158,11,0.2)]',
+    tabActive: 'accounts-tab-active border-amber-400/45 bg-amber-500/16 text-amber-50',
     tabIdle: 'border-amber-500/20 bg-black/10 text-amber-200/85 hover:bg-amber-500/10',
     cardGlow: 'hover:border-amber-400/35',
     shortLabel: '普通用户',
@@ -864,12 +950,6 @@ function toggleTableSort(key: TableSortKey) {
   persistTableSortState()
 }
 
-function getTableSortIcon(key: TableSortKey) {
-  if (tableSortKey.value !== key)
-    return 'i-carbon-arrows-vertical'
-  return tableSortDirection.value === 'asc' ? 'i-carbon-arrow-up' : 'i-carbon-arrow-down'
-}
-
 function getTableSortLabel(key: TableSortKey) {
   const labels: Record<TableSortKey, string> = {
     account: '账号',
@@ -952,19 +1032,19 @@ const ownershipTabs = computed(() => [
 function getOwnershipTabClasses(section: OwnershipSection, active: boolean) {
   const styles = {
     mine: {
-      active: 'border-primary-400/50 bg-primary-500/18 text-primary-50 shadow-[0_8px_30px_rgba(34,197,94,0.2)]',
+      active: 'accounts-tab-active border-primary-400/50 bg-primary-500/18 text-primary-50',
       idle: 'border-primary-500/20 bg-black/10 text-primary-200/85 hover:bg-primary-500/10',
     },
     other_user: {
-      active: 'border-amber-400/45 bg-amber-500/16 text-amber-50 shadow-[0_8px_30px_rgba(245,158,11,0.2)]',
+      active: 'accounts-tab-active border-amber-400/45 bg-amber-500/16 text-amber-50',
       idle: 'border-amber-500/20 bg-black/10 text-amber-200/85 hover:bg-amber-500/10',
     },
     other_admin: {
-      active: 'border-violet-400/45 bg-violet-500/16 text-violet-50 shadow-[0_8px_30px_rgba(167,139,250,0.2)]',
+      active: 'accounts-tab-active border-violet-400/45 bg-violet-500/16 text-violet-50',
       idle: 'border-violet-500/20 bg-black/10 text-violet-200/85 hover:bg-violet-500/10',
     },
     unowned: {
-      active: 'border-slate-300/70 bg-slate-500/15 text-slate-100 shadow-[0_8px_30px_rgba(148,163,184,0.2)]',
+      active: 'accounts-tab-active border-slate-300/70 bg-slate-500/15 text-slate-100',
       idle: 'border-slate-400/20 bg-black/10 text-slate-300/80 hover:bg-slate-500/10',
     },
   }
@@ -1586,13 +1666,12 @@ async function handleSafeCheck(acc: any) {
   }
 }
 
-onMounted(() => {
-  viewMode.value = readViewMode()
-  readTableSortState()
-  readTableColumnVisibility()
-  readActionHistory()
+onMounted(async () => {
+  await hydrateAccountsPagePreferences()
   applyQueryState()
-  initializePage()
+  await initializePage()
+  enableAccountsViewSync()
+  enableAccountsActionHistorySync()
 })
 
 watch(adminToken, (val) => {
@@ -1607,51 +1686,59 @@ useIntervalFn(() => {
 </script>
 
 <template>
-  <div class="mx-auto max-w-7xl w-full p-4">
-    <div class="mb-6 space-y-4">
-      <div class="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-        <div class="min-w-0 flex-1 space-y-3">
-          <div>
-            <h1 class="text-2xl font-bold">
-              账号管理
-            </h1>
-            <p class="glass-text-muted mt-1 text-sm">
-              在一个页面里完成归属区分、搜索筛选、批量处理和账号状态查看。
-            </p>
-          </div>
+  <div class="accounts-page ui-page-shell ui-page-stack ui-page-density-compact w-full">
+    <div class="ui-page-header">
+      <BaseAccountViewSwitcherLayout class="w-full">
+        <template #main>
+          <div class="ui-page-header__main min-w-0 space-y-3">
+            <div>
+              <h1 class="ui-page-title">
+                账号管理
+              </h1>
+              <p class="ui-page-desc">
+                在一个页面里完成归属区分、搜索筛选、批量处理和账号状态查看。
+              </p>
+            </div>
 
-          <div class="flex flex-wrap gap-2">
-            <button
-              v-for="tab in ownershipTabs"
-              :key="tab.section"
-              class="inline-flex items-center gap-2 border rounded-full px-4 py-2 text-sm font-semibold backdrop-blur-sm transition-all duration-200"
-              :class="getOwnershipTabClasses(tab.section, ownershipFilter === tab.section)"
-              @click="toggleOwnershipFilter(tab.section)"
-            >
-              <span>{{ tab.label }}</span>
-              <span class="rounded-full bg-white/12 px-2 py-0.5 text-xs text-white/90">
-                {{ tab.count }}
-              </span>
-            </button>
+            <div class="flex flex-wrap gap-2">
+              <button
+                v-for="tab in ownershipTabs"
+                :key="tab.section"
+                class="inline-flex items-center gap-2 border rounded-full px-4 py-2 text-sm font-semibold backdrop-blur-sm transition-all duration-200"
+                :class="getOwnershipTabClasses(tab.section, ownershipFilter === tab.section)"
+                @click="toggleOwnershipFilter(tab.section)"
+              >
+                <span>{{ tab.label }}</span>
+                <span class="rounded-full bg-white/18 px-2 py-0.5 text-xs text-white">
+                  {{ tab.count }}
+                </span>
+              </button>
+            </div>
           </div>
-        </div>
+        </template>
 
-        <div class="flex flex-col items-start gap-3 xl:min-w-[360px] xl:items-end">
-          <div class="flex flex-wrap gap-2 xl:justify-end">
-            <button
-              v-for="option in viewOptions"
-              :key="option.value"
-              class="inline-flex items-center gap-2 border rounded-full px-3.5 py-2 text-sm font-semibold transition-all duration-200"
-              :class="viewMode === option.value ? 'border-white/20 bg-white/12 text-white shadow-[0_10px_30px_rgba(15,23,42,0.22)]' : 'border-white/8 bg-black/10 text-gray-300 hover:bg-white/8'"
-              @click="setViewMode(option.value)"
-            >
-              <div class="text-sm" :class="[option.icon]" />
-              {{ option.shortLabel }}
-            </button>
+        <template #switchers>
+          <button
+            v-for="option in viewOptions"
+            :key="option.value"
+            class="inline-flex items-center gap-2 border rounded-full px-3.5 py-2 text-sm font-semibold transition-all duration-200"
+            :class="viewMode === option.value ? 'accounts-mode-active border-white/20 bg-white/18 text-white' : 'border-white/8 bg-black/10 text-gray-200 hover:bg-white/8'"
+            @click="setViewMode(option.value)"
+          >
+            <div class="text-sm" :class="[option.icon]" />
+            {{ option.shortLabel }}
+          </button>
+        </template>
+
+        <template #note>
+          <div class="border border-sky-200/70 rounded-2xl bg-sky-50/70 px-3 py-2 text-xs text-sky-700 leading-5 dark:border-sky-800/40 dark:bg-sky-900/15 dark:text-sky-200">
+            {{ ACCOUNT_VIEW_PREFERENCES_NOTE }}
           </div>
+        </template>
 
-          <div class="flex flex-wrap items-center gap-3">
-            <div class="text-sm text-gray-300/80">
+        <template #actions>
+          <div class="ui-page-actions">
+            <div class="text-sm text-gray-200">
               当前显示 <span class="text-white font-semibold">{{ filteredAccounts.length }}</span> / {{ accounts.length }} 个账号
             </div>
             <BaseButton
@@ -1662,50 +1749,46 @@ useIntervalFn(() => {
               添加账号
             </BaseButton>
           </div>
-        </div>
+        </template>
+      </BaseAccountViewSwitcherLayout>
+    </div>
+
+    <div class="glass-panel ui-filter-panel">
+      <div class="ui-filter-grid lg:grid-cols-[minmax(0,1.8fr)_repeat(3,minmax(0,0.9fr))]">
+        <BaseInput
+          v-model="searchKeyword"
+          label="搜索账号"
+          placeholder="搜索备注、UIN、归属用户名、平台"
+          clearable
+        />
+        <BaseSelect
+          v-model="platformFilter"
+          label="平台筛选"
+          :options="platformOptions"
+        />
+        <BaseSelect
+          v-model="stateFilter"
+          label="状态筛选"
+          :options="stateOptions"
+        />
+        <BaseSelect
+          v-model="sortMode"
+          label="排序方式"
+          :options="sortOptions"
+        />
       </div>
 
-      <div class="glass-panel rounded-2xl p-4 shadow-sm">
-        <div class="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1.8fr)_repeat(3,minmax(0,0.9fr))]">
-          <BaseInput
-            v-model="searchKeyword"
-            label="搜索账号"
-            placeholder="搜索备注、UIN、归属用户名、平台"
-            clearable
-          />
-          <BaseSelect
-            v-model="platformFilter"
-            label="平台筛选"
-            :options="platformOptions"
-          />
-          <BaseSelect
-            v-model="stateFilter"
-            label="状态筛选"
-            :options="stateOptions"
-          />
-          <BaseSelect
-            v-model="sortMode"
-            label="排序方式"
-            :options="sortOptions"
-          />
-        </div>
-
-        <div class="mt-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-          <div class="flex flex-wrap gap-2 text-xs">
-            <span class="border border-white/10 rounded-full bg-black/10 px-3 py-1 text-gray-300">
-              归属：{{ currentOwnershipLabel }}
-            </span>
-            <span class="border border-white/10 rounded-full bg-black/10 px-3 py-1 text-gray-300">
-              平台：{{ platformOptions.find(item => item.value === platformFilter)?.label || '全部平台' }}
-            </span>
-            <span class="border border-white/10 rounded-full bg-black/10 px-3 py-1 text-gray-300">
-              状态：{{ stateOptions.find(item => item.value === stateFilter)?.label || '全部状态' }}
-            </span>
-            <span class="border border-white/10 rounded-full bg-black/10 px-3 py-1 text-gray-300">
-              视图：{{ currentViewLabel }}
-            </span>
-          </div>
-          <div class="flex flex-wrap items-center self-start gap-2 lg:self-auto">
+      <BaseTableToolbar>
+        <template #left>
+          <BaseFilterChips class="text-xs">
+            <BaseFilterChip>归属：{{ currentOwnershipLabel }}</BaseFilterChip>
+            <BaseFilterChip>平台：{{ platformOptions.find(item => item.value === platformFilter)?.label || '全部平台' }}</BaseFilterChip>
+            <BaseFilterChip>状态：{{ stateOptions.find(item => item.value === stateFilter)?.label || '全部状态' }}</BaseFilterChip>
+            <BaseFilterChip>视图：{{ currentViewLabel }}</BaseFilterChip>
+          </BaseFilterChips>
+        </template>
+        <template #right>
+          <BaseBulkActions class="self-start lg:self-auto">
             <BaseButton
               variant="ghost"
               size="sm"
@@ -1725,314 +1808,317 @@ useIntervalFn(() => {
               <div class="i-carbon-clean mr-1" />
               清空筛选
             </BaseButton>
-          </div>
-        </div>
-      </div>
+          </BaseBulkActions>
+        </template>
+      </BaseTableToolbar>
     </div>
 
-    <div v-if="accounts.length > 0" class="glass-panel mb-4 flex flex-col gap-3 rounded-lg p-3 shadow-sm xl:flex-row xl:items-center xl:justify-between">
-      <div class="flex flex-wrap items-center gap-2">
-        <BaseButton
-          size="sm"
-          class="border-0 from-blue-500 to-blue-600 bg-gradient-to-r text-xs text-white font-bold shadow-blue-500/25 shadow-md transition-all hover:from-blue-600 hover:to-blue-700 !px-4 !py-1.5 dark:shadow-blue-500/40 hover:shadow-blue-500/40 hover:shadow-lg"
-          :disabled="filteredAccounts.length === 0"
-          @click="selectAll"
-        >
-          <div class="i-carbon-checkmark-outline mr-1.5 text-sm" /> 全选
-        </BaseButton>
-        <BaseButton
-          size="sm"
-          class="border border-gray-300/50 bg-black/5 text-xs font-bold transition-all dark:bg-white/5 hover:bg-black/10 !px-4 !py-1.5 dark:hover:bg-white/10"
-          :disabled="filteredAccounts.length === 0"
-          @click="invertSelection"
-        >
-          反选
-        </BaseButton>
-        <BaseButton
-          size="sm"
-          class="border-0 from-red-500 to-red-600 bg-gradient-to-r text-xs text-white font-bold shadow-md shadow-red-500/25 transition-all hover:from-red-600 hover:to-red-700 !px-4 !py-1.5 dark:shadow-red-500/40 hover:shadow-lg hover:shadow-red-500/40"
-          :disabled="selectedAccountIds.length === 0"
-          @click="clearSelection"
-        >
-          <div class="i-carbon-close-outline mr-1.5 text-sm" /> 清空
-        </BaseButton>
+    <BaseManagementBar v-if="accounts.length > 0" class="glass-panel mb-4">
+      <template #primary>
+        <BaseBulkActions>
+          <BaseButton
+            size="sm"
+            class="border-0 from-blue-500 to-blue-600 bg-gradient-to-r text-xs text-white font-bold shadow-blue-500/25 shadow-md transition-all hover:from-blue-600 hover:to-blue-700 !px-4 !py-1.5 dark:shadow-blue-500/40 hover:shadow-blue-500/40 hover:shadow-lg"
+            :disabled="filteredAccounts.length === 0"
+            @click="selectAll"
+          >
+            <div class="i-carbon-checkmark-outline mr-1.5 text-sm" /> 全选
+          </BaseButton>
+          <BaseButton
+            size="sm"
+            class="border border-gray-300/50 bg-black/5 text-xs font-bold transition-all dark:bg-white/5 hover:bg-black/10 !px-4 !py-1.5 dark:hover:bg-white/10"
+            :disabled="filteredAccounts.length === 0"
+            @click="invertSelection"
+          >
+            反选
+          </BaseButton>
+          <BaseButton
+            size="sm"
+            class="border-0 from-red-500 to-red-600 bg-gradient-to-r text-xs text-white font-bold shadow-md shadow-red-500/25 transition-all hover:from-red-600 hover:to-red-700 !px-4 !py-1.5 dark:shadow-red-500/40 hover:shadow-lg hover:shadow-red-500/40"
+            :disabled="selectedAccountIds.length === 0"
+            @click="clearSelection"
+          >
+            <div class="i-carbon-close-outline mr-1.5 text-sm" /> 清空
+          </BaseButton>
 
-        <span class="glass-text-muted ml-1 text-xs font-medium">
-          已选 {{ selectedAccountIds.length }} 项，当前筛选 {{ filteredAccounts.length }} 项
-        </span>
-      </div>
-
-      <div class="flex flex-wrap items-center gap-2">
-        <div v-if="isAdmin" class="min-w-[220px]">
-          <BaseSelect
-            v-model="transferOwnershipTarget"
-            label="批量转移归属"
-            :options="ownershipTransferOptions"
-            placeholder="选择目标归属账号"
+          <BaseSelectionSummary
+            :selected-count="selectedAccountIds.length"
+            :filtered-count="filteredAccounts.length"
+            class="ml-1"
           />
-        </div>
-        <BaseButton
-          v-if="isAdmin"
-          variant="secondary"
-          size="sm"
-          :disabled="!canBatchTransferOwnership || transferLoading"
-          class="text-xs transition-opacity !border-violet-500/20 !bg-violet-500/10 !text-violet-200 hover:!bg-violet-500/20"
-          :class="!canBatchTransferOwnership ? 'opacity-50' : 'opacity-100'"
-          :title="transferTargetLabel ? `转移到 ${transferTargetLabel}` : '请先选择目标归属账号'"
-          @click="batchTransferOwnership"
-        >
-          <div v-if="transferLoading" class="i-svg-spinners-ring-resize mr-1 text-sm" />
-          <div v-else class="i-carbon-user-admin mr-1 text-sm" />
-          转移归属
-        </BaseButton>
-        <BaseButton
-          variant="secondary"
-          size="sm"
-          :disabled="selectedAccountIds.length === 0 || batchLoading"
-          class="text-xs transition-opacity !border-primary-500/20 !bg-primary-500/10 !text-primary-100 hover:!bg-primary-500/20"
-          :class="selectedAccountIds.length === 0 ? 'opacity-50' : 'opacity-100'"
-          @click="bulkSetMode('main')"
-        >
-          <div v-if="batchActionType === 'mode:main'" class="i-svg-spinners-ring-resize mr-1 text-sm" />
-          <div v-else class="i-carbon-star-filled mr-1 text-sm" />
-          批量设为主号
-        </BaseButton>
-        <BaseButton
-          variant="secondary"
-          size="sm"
-          :disabled="startableSelectedAccounts.length === 0 || batchLoading"
-          class="text-xs transition-opacity !border-blue-500/20 !bg-blue-500/10 !text-blue-200 hover:!bg-blue-500/20"
-          :class="startableSelectedAccounts.length === 0 ? 'opacity-50' : 'opacity-100'"
-          @click="batchToggleAccounts('start')"
-        >
-          <div v-if="batchActionType === 'start'" class="i-svg-spinners-ring-resize mr-1 text-sm" />
-          <div v-else class="i-carbon-play-filled mr-1 text-sm" />
-          批量启动
-        </BaseButton>
-        <BaseButton
-          variant="secondary"
-          size="sm"
-          :disabled="stoppableSelectedAccounts.length === 0 || batchLoading"
-          class="text-xs transition-opacity !border-orange-500/20 !bg-orange-500/10 !text-orange-200 hover:!bg-orange-500/20"
-          :class="stoppableSelectedAccounts.length === 0 ? 'opacity-50' : 'opacity-100'"
-          @click="batchToggleAccounts('stop')"
-        >
-          <div v-if="batchActionType === 'stop'" class="i-svg-spinners-ring-resize mr-1 text-sm" />
-          <div v-else class="i-carbon-stop-filled mr-1 text-sm" />
-          批量停止
-        </BaseButton>
-        <BaseButton
-          variant="secondary"
-          size="sm"
-          :disabled="restartableSelectedAccounts.length === 0 || batchLoading"
-          class="text-xs transition-opacity !border-cyan-500/20 !bg-cyan-500/10 !text-cyan-200 hover:!bg-cyan-500/20"
-          :class="restartableSelectedAccounts.length === 0 ? 'opacity-50' : 'opacity-100'"
-          @click="batchRestartAccounts"
-        >
-          <div v-if="batchActionType === 'restart'" class="i-svg-spinners-ring-resize mr-1 text-sm" />
-          <div v-else class="i-carbon-renew mr-1 text-sm" />
-          批量重启
-        </BaseButton>
-        <BaseButton
-          variant="secondary"
-          size="sm"
-          :disabled="selectedAccountIds.length === 0 || batchLoading"
-          class="text-xs transition-opacity"
-          :class="selectedAccountIds.length === 0 ? 'opacity-50' : 'opacity-100'"
-          @click="bulkSetMode('alt')"
-        >
-          <div v-if="batchActionType === 'mode:alt'" class="i-svg-spinners-ring-resize mr-1 text-sm" />
-          <div v-else class="i-carbon-copy mr-1 text-sm" />
-          批量设为小号
-        </BaseButton>
-        <BaseButton
-          variant="secondary"
-          size="sm"
-          :disabled="selectedAccountIds.length === 0 || batchLoading"
-          class="text-xs transition-opacity !border-emerald-500/20 !bg-emerald-500/10 !text-emerald-600 hover:!bg-emerald-500/20 dark:!text-emerald-400"
-          :class="selectedAccountIds.length === 0 ? 'opacity-50' : 'opacity-100'"
-          @click="bulkSetMode('safe')"
-        >
-          <div v-if="batchActionType === 'mode:safe'" class="i-svg-spinners-ring-resize mr-1 text-sm" />
-          <div v-else class="i-carbon-security mr-1 text-sm" />
-          批量设为风险规避
-        </BaseButton>
-        <BaseButton
-          variant="ghost"
-          size="sm"
-          class="border border-white/10 rounded-full bg-black/10 text-xs text-gray-200 hover:bg-white/8"
-          :disabled="displayAccounts.length === 0"
-          :loading="exportLoading && exportScope === 'all'"
-          @click="exportAccounts('all')"
-        >
-          <div v-if="!(exportLoading && exportScope === 'all')" class="i-carbon-document-export mr-1 text-sm" />
-          导出当前结果
-        </BaseButton>
-        <BaseButton
-          variant="ghost"
-          size="sm"
-          class="border border-white/10 rounded-full bg-black/10 text-xs text-gray-200 hover:bg-white/8"
-          :disabled="selectedAccounts.length === 0 || exportLoading"
-          :loading="exportLoading && exportScope === 'selected'"
-          @click="exportAccounts('selected')"
-        >
-          <div v-if="!(exportLoading && exportScope === 'selected')" class="i-carbon-export mr-1 text-sm" />
-          导出已选
-        </BaseButton>
-        <BaseButton
-          variant="ghost"
-          size="sm"
-          class="border border-red-500/20 rounded-full bg-red-500/8 text-xs text-red-300 hover:bg-red-500/14"
-          :disabled="!canBatchDelete || batchDeleteLoading"
-          @click="openBatchDeleteConfirm"
-        >
-          <div class="i-carbon-trash-can mr-1 text-sm" />
-          批量删除
-        </BaseButton>
-      </div>
-    </div>
+        </BaseBulkActions>
+      </template>
 
-    <div v-if="accounts.length > 0" class="glass-panel mb-4 rounded-[24px] p-4 shadow-sm">
-      <div class="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-        <div class="min-w-0 flex-1">
-          <div class="flex flex-wrap items-center gap-2">
-            <h3 class="text-base font-semibold">
-              最近操作结果
-            </h3>
-            <span class="border border-white/8 rounded-full bg-black/10 px-3 py-1 text-xs text-gray-300">
-              最近保留 {{ actionHistoryCount }} 条
-            </span>
-            <span
-              v-if="latestActionHistory"
-              class="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold"
-              :class="getActionHistoryStatusMeta(latestActionHistory.status).badge"
-            >
-              <div :class="getActionHistoryStatusMeta(latestActionHistory.status).icon" />
-              {{ getActionHistoryStatusMeta(latestActionHistory.status).label }}
-            </span>
+      <template #secondary>
+        <BaseBulkActions>
+          <div v-if="isAdmin" class="min-w-[220px]">
+            <BaseSelect
+              v-model="transferOwnershipTarget"
+              label="批量转移归属"
+              :options="ownershipTransferOptions"
+              placeholder="选择目标归属账号"
+            />
           </div>
-
-          <div v-if="latestActionHistory" class="mt-4 space-y-3">
-            <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-              <div class="min-w-0">
-                <div class="line-clamp-1 text-lg font-semibold">
-                  {{ latestActionHistory.actionLabel }}
-                </div>
-                <p class="glass-text-muted mt-1 text-sm">
-                  {{ buildActionResultMessage(latestActionHistory.actionLabel, latestActionHistory.successCount, latestActionHistory.failedNames, latestActionHistory.skippedCount) }}
-                </p>
-              </div>
-              <div class="flex flex-wrap items-center gap-2 text-xs text-gray-300">
-                <span class="border border-white/8 rounded-full bg-black/10 px-3 py-1">
-                  {{ formatActionTime(latestActionHistory.timestamp) }}
-                </span>
-                <span class="border border-white/8 rounded-full bg-black/10 px-3 py-1">
-                  {{ formatDateTime(latestActionHistory.timestamp) }}
-                </span>
-              </div>
-            </div>
-
-            <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
-              <div class="border border-white/8 rounded-2xl bg-black/10 p-3.5">
-                <div class="text-[11px] text-gray-400 tracking-[0.18em] uppercase">
-                  涉及账号
-                </div>
-                <div class="mt-3 text-2xl font-semibold">
-                  {{ latestActionHistory.totalCount }}
-                </div>
-                <div class="glass-text-muted mt-2 text-xs">
-                  {{ latestActionHistory.affectedNames.join('、') || '暂无名称预览' }}
-                </div>
-              </div>
-              <div class="border border-white/8 rounded-2xl bg-black/10 p-3.5">
-                <div class="text-[11px] text-gray-400 tracking-[0.18em] uppercase">
-                  执行结果
-                </div>
-                <div class="mt-3 flex flex-wrap gap-2 text-xs">
-                  <span class="rounded-full bg-emerald-500/10 px-2.5 py-1 text-emerald-300">成功 {{ latestActionHistory.successCount }}</span>
-                  <span class="rounded-full bg-red-500/10 px-2.5 py-1 text-red-300">失败 {{ latestActionHistory.failedCount }}</span>
-                  <span class="rounded-full bg-amber-500/10 px-2.5 py-1 text-amber-300">跳过 {{ latestActionHistory.skippedCount }}</span>
-                </div>
-                <div class="glass-text-muted mt-2 text-xs leading-5">
-                  {{ latestActionHistory.failedNames.length > 0 ? `失败账号：${latestActionHistory.failedNames.join('、')}` : '最近一次执行没有失败账号。' }}
-                </div>
-              </div>
-              <div class="border border-white/8 rounded-2xl bg-black/10 p-3.5">
-                <div class="text-[11px] text-gray-400 tracking-[0.18em] uppercase">
-                  附加信息
-                </div>
-                <div class="mt-3 text-sm font-semibold leading-6">
-                  {{ latestActionHistory.targetLabel || '无附加说明' }}
-                </div>
-                <div class="glass-text-muted mt-2 text-xs leading-5">
-                  可用于回看最近一次批量处理的目标、范围和结果摘要。
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div v-else class="mt-4 border border-white/10 rounded-2xl border-dashed bg-black/8 px-4 py-5 text-sm text-gray-300">
-            最近操作历史会记录在这里。执行批量启动、重启、导出、转移归属或批量删除后，可以直接回看结果摘要。
-          </div>
-        </div>
-
-        <div class="flex flex-wrap items-center gap-2 xl:justify-end">
+          <BaseButton
+            v-if="isAdmin"
+            variant="secondary"
+            size="sm"
+            :disabled="!canBatchTransferOwnership || transferLoading"
+            class="text-xs transition-opacity !border-violet-500/20 !bg-violet-500/10 !text-violet-200 hover:!bg-violet-500/20"
+            :class="!canBatchTransferOwnership ? 'opacity-50' : 'opacity-100'"
+            :title="transferTargetLabel ? `转移到 ${transferTargetLabel}` : '请先选择目标归属账号'"
+            @click="batchTransferOwnership"
+          >
+            <div v-if="transferLoading" class="i-svg-spinners-ring-resize mr-1 text-sm" />
+            <div v-else class="i-carbon-user-admin mr-1 text-sm" />
+            转移归属
+          </BaseButton>
+          <BaseButton
+            variant="secondary"
+            size="sm"
+            :disabled="selectedAccountIds.length === 0 || batchLoading"
+            class="text-xs transition-opacity !border-primary-500/20 !bg-primary-500/10 !text-primary-100 hover:!bg-primary-500/20"
+            :class="selectedAccountIds.length === 0 ? 'opacity-50' : 'opacity-100'"
+            @click="bulkSetMode('main')"
+          >
+            <div v-if="batchActionType === 'mode:main'" class="i-svg-spinners-ring-resize mr-1 text-sm" />
+            <div v-else class="i-carbon-star-filled mr-1 text-sm" />
+            批量设为主号
+          </BaseButton>
+          <BaseButton
+            variant="secondary"
+            size="sm"
+            :disabled="startableSelectedAccounts.length === 0 || batchLoading"
+            class="text-xs transition-opacity !border-blue-500/20 !bg-blue-500/10 !text-blue-200 hover:!bg-blue-500/20"
+            :class="startableSelectedAccounts.length === 0 ? 'opacity-50' : 'opacity-100'"
+            @click="batchToggleAccounts('start')"
+          >
+            <div v-if="batchActionType === 'start'" class="i-svg-spinners-ring-resize mr-1 text-sm" />
+            <div v-else class="i-carbon-play-filled mr-1 text-sm" />
+            批量启动
+          </BaseButton>
+          <BaseButton
+            variant="secondary"
+            size="sm"
+            :disabled="stoppableSelectedAccounts.length === 0 || batchLoading"
+            class="text-xs transition-opacity !border-orange-500/20 !bg-orange-500/10 !text-orange-200 hover:!bg-orange-500/20"
+            :class="stoppableSelectedAccounts.length === 0 ? 'opacity-50' : 'opacity-100'"
+            @click="batchToggleAccounts('stop')"
+          >
+            <div v-if="batchActionType === 'stop'" class="i-svg-spinners-ring-resize mr-1 text-sm" />
+            <div v-else class="i-carbon-stop-filled mr-1 text-sm" />
+            批量停止
+          </BaseButton>
+          <BaseButton
+            variant="secondary"
+            size="sm"
+            :disabled="restartableSelectedAccounts.length === 0 || batchLoading"
+            class="text-xs transition-opacity !border-cyan-500/20 !bg-cyan-500/10 !text-cyan-200 hover:!bg-cyan-500/20"
+            :class="restartableSelectedAccounts.length === 0 ? 'opacity-50' : 'opacity-100'"
+            @click="batchRestartAccounts"
+          >
+            <div v-if="batchActionType === 'restart'" class="i-svg-spinners-ring-resize mr-1 text-sm" />
+            <div v-else class="i-carbon-renew mr-1 text-sm" />
+            批量重启
+          </BaseButton>
+          <BaseButton
+            variant="secondary"
+            size="sm"
+            :disabled="selectedAccountIds.length === 0 || batchLoading"
+            class="text-xs transition-opacity"
+            :class="selectedAccountIds.length === 0 ? 'opacity-50' : 'opacity-100'"
+            @click="bulkSetMode('alt')"
+          >
+            <div v-if="batchActionType === 'mode:alt'" class="i-svg-spinners-ring-resize mr-1 text-sm" />
+            <div v-else class="i-carbon-copy mr-1 text-sm" />
+            批量设为小号
+          </BaseButton>
+          <BaseButton
+            variant="secondary"
+            size="sm"
+            :disabled="selectedAccountIds.length === 0 || batchLoading"
+            class="text-xs transition-opacity !border-emerald-500/20 !bg-emerald-500/10 !text-emerald-600 hover:!bg-emerald-500/20 dark:!text-emerald-400"
+            :class="selectedAccountIds.length === 0 ? 'opacity-50' : 'opacity-100'"
+            @click="bulkSetMode('safe')"
+          >
+            <div v-if="batchActionType === 'mode:safe'" class="i-svg-spinners-ring-resize mr-1 text-sm" />
+            <div v-else class="i-carbon-security mr-1 text-sm" />
+            批量设为风险规避
+          </BaseButton>
           <BaseButton
             variant="ghost"
             size="sm"
             class="border border-white/10 rounded-full bg-black/10 text-xs text-gray-200 hover:bg-white/8"
-            :disabled="!latestActionHistory"
-            @click="copyLatestActionSummary"
+            :disabled="displayAccounts.length === 0"
+            :loading="exportLoading && exportScope === 'all'"
+            @click="exportAccounts('all')"
           >
-            <div class="i-carbon-copy-file mr-1 text-sm" />
-            复制最近摘要
+            <div v-if="!(exportLoading && exportScope === 'all')" class="i-carbon-document-export mr-1 text-sm" />
+            导出当前结果
+          </BaseButton>
+          <BaseButton
+            variant="ghost"
+            size="sm"
+            class="border border-white/10 rounded-full bg-black/10 text-xs text-gray-200 hover:bg-white/8"
+            :disabled="selectedAccounts.length === 0 || exportLoading"
+            :loading="exportLoading && exportScope === 'selected'"
+            @click="exportAccounts('selected')"
+          >
+            <div v-if="!(exportLoading && exportScope === 'selected')" class="i-carbon-export mr-1 text-sm" />
+            导出已选
           </BaseButton>
           <BaseButton
             variant="ghost"
             size="sm"
             class="border border-red-500/20 rounded-full bg-red-500/8 text-xs text-red-300 hover:bg-red-500/14"
-            :disabled="actionHistoryCount === 0"
-            @click="clearActionHistory"
+            :disabled="!canBatchDelete || batchDeleteLoading"
+            @click="openBatchDeleteConfirm"
           >
-            <div class="i-carbon-clean mr-1 text-sm" />
-            清空记录
+            <div class="i-carbon-trash-can mr-1 text-sm" />
+            批量删除
           </BaseButton>
+        </BaseBulkActions>
+      </template>
+    </BaseManagementBar>
+
+    <BaseHistorySummaryPanel v-if="accounts.length > 0" class="mb-4 rounded-[24px]">
+      <template #title>
+        <div class="flex flex-wrap items-center gap-2">
+          <h3 class="ui-history-panel__title text-base font-semibold">
+            最近操作结果
+          </h3>
+          <BaseFilterChip>最近保留 {{ actionHistoryCount }} 条</BaseFilterChip>
+          <BaseFilterChip
+            v-if="latestActionHistory"
+            class="gap-1.5 font-semibold"
+            :class="getActionHistoryStatusMeta(latestActionHistory.status).badge"
+          >
+            <div :class="getActionHistoryStatusMeta(latestActionHistory.status).icon" />
+            {{ getActionHistoryStatusMeta(latestActionHistory.status).label }}
+          </BaseFilterChip>
+        </div>
+      </template>
+
+      <template #actions>
+        <BaseButton
+          variant="ghost"
+          size="sm"
+          class="border border-white/10 rounded-full bg-black/10 text-xs text-gray-200 hover:bg-white/8"
+          :disabled="!latestActionHistory"
+          @click="copyLatestActionSummary"
+        >
+          <div class="i-carbon-copy-file mr-1 text-sm" />
+          复制最近摘要
+        </BaseButton>
+        <BaseButton
+          variant="ghost"
+          size="sm"
+          class="border border-red-500/20 rounded-full bg-red-500/8 text-xs text-red-300 hover:bg-red-500/14"
+          :disabled="actionHistoryCount === 0"
+          @click="clearActionHistory"
+        >
+          <div class="i-carbon-clean mr-1 text-sm" />
+          清空记录
+        </BaseButton>
+      </template>
+
+      <div v-if="latestActionHistory" class="space-y-3">
+        <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+          <div class="min-w-0">
+            <div class="line-clamp-1 text-lg font-semibold">
+              {{ latestActionHistory.actionLabel }}
+            </div>
+            <p class="glass-text-muted mt-1 text-sm">
+              {{ buildActionResultMessage(latestActionHistory.actionLabel, latestActionHistory.successCount, latestActionHistory.failedNames, latestActionHistory.skippedCount) }}
+            </p>
+            <p class="mt-2 text-xs text-sky-300/90 leading-5">
+              {{ ACTION_HISTORY_SYNC_NOTE }}
+            </p>
+          </div>
+          <BaseFilterChips class="text-xs text-gray-200">
+            <BaseFilterChip>{{ formatActionTime(latestActionHistory.timestamp) }}</BaseFilterChip>
+            <BaseFilterChip>{{ formatDateTime(latestActionHistory.timestamp) }}</BaseFilterChip>
+          </BaseFilterChips>
+        </div>
+
+        <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
+          <div class="border border-white/8 rounded-2xl bg-black/10 p-3.5">
+            <div class="text-[11px] text-gray-400 tracking-[0.18em] uppercase">
+              涉及账号
+            </div>
+            <div class="mt-3 text-2xl font-semibold">
+              {{ latestActionHistory.totalCount }}
+            </div>
+            <div class="glass-text-muted mt-2 text-xs">
+              {{ latestActionHistory.affectedNames.join('、') || '暂无名称预览' }}
+            </div>
+          </div>
+          <div class="border border-white/8 rounded-2xl bg-black/10 p-3.5">
+            <div class="text-[11px] text-gray-400 tracking-[0.18em] uppercase">
+              执行结果
+            </div>
+            <div class="mt-3 flex flex-wrap gap-2 text-xs">
+              <span class="rounded-full bg-emerald-500/10 px-2.5 py-1 text-emerald-300">成功 {{ latestActionHistory.successCount }}</span>
+              <span class="rounded-full bg-red-500/10 px-2.5 py-1 text-red-300">失败 {{ latestActionHistory.failedCount }}</span>
+              <span class="rounded-full bg-amber-500/10 px-2.5 py-1 text-amber-300">跳过 {{ latestActionHistory.skippedCount }}</span>
+            </div>
+            <div class="glass-text-muted mt-2 text-xs leading-5">
+              {{ latestActionHistory.failedNames.length > 0 ? `失败账号：${latestActionHistory.failedNames.join('、')}` : '最近一次执行没有失败账号。' }}
+            </div>
+          </div>
+          <div class="border border-white/8 rounded-2xl bg-black/10 p-3.5">
+            <div class="text-[11px] text-gray-400 tracking-[0.18em] uppercase">
+              附加信息
+            </div>
+            <div class="mt-3 text-sm font-semibold leading-6">
+              {{ latestActionHistory.targetLabel || '无附加说明' }}
+            </div>
+            <div class="glass-text-muted mt-2 text-xs leading-5">
+              可用于回看最近一次批量处理的目标、范围和结果摘要。
+            </div>
+          </div>
         </div>
       </div>
 
-      <div v-if="recentActionHistory.length > 0" class="grid grid-cols-1 mt-4 gap-3 2xl:grid-cols-4 lg:grid-cols-2">
-        <button
-          v-for="item in recentActionHistory"
-          :key="item.id"
-          class="min-h-[166px] flex flex-col border rounded-2xl px-4 py-3 text-left transition-all hover:shadow-lg hover:-translate-y-0.5"
-          :class="getActionHistoryStatusMeta(item.status).accent"
-          @click="copyText(buildHistorySummaryText(item), '操作摘要已复制')"
-        >
-          <div class="flex items-start justify-between gap-3">
-            <div class="min-w-0">
-              <div class="line-clamp-1 text-sm font-semibold">
-                {{ item.actionLabel }}
-              </div>
-              <div class="mt-1 text-xs opacity-80">
-                {{ formatActionTime(item.timestamp) }}
-              </div>
-            </div>
-            <div class="text-base" :class="getActionHistoryStatusMeta(item.status).icon" />
-          </div>
-          <p class="line-clamp-3 mt-3 text-xs leading-5 opacity-90">
-            {{ buildActionResultMessage(item.actionLabel, item.successCount, item.failedNames, item.skippedCount) }}
-          </p>
-          <div class="mt-3 flex flex-wrap gap-2 text-[11px]">
-            <span class="rounded-full bg-black/15 px-2.5 py-1">总计 {{ item.totalCount }}</span>
-            <span class="rounded-full bg-black/15 px-2.5 py-1">成功 {{ item.successCount }}</span>
-            <span class="rounded-full bg-black/15 px-2.5 py-1">失败 {{ item.failedCount }}</span>
-          </div>
-          <div class="mt-auto pt-3 text-[11px] opacity-75">
-            {{ item.targetLabel || '点击复制本次摘要' }}
-          </div>
-        </button>
+      <div v-else class="border border-white/10 rounded-2xl border-dashed bg-black/8 px-4 py-5 text-sm text-gray-200">
+        最近操作历史会记录在这里。执行批量启动、重启、导出、转移归属或批量删除后，可以直接回看结果摘要。
       </div>
-    </div>
+
+      <template #recent>
+        <div v-if="recentActionHistory.length > 0" class="grid grid-cols-1 gap-3 2xl:grid-cols-4 lg:grid-cols-2">
+          <button
+            v-for="item in recentActionHistory"
+            :key="item.id"
+            class="min-h-[166px] flex flex-col border rounded-2xl px-4 py-3 text-left transition-all hover:shadow-lg hover:-translate-y-0.5"
+            :class="getActionHistoryStatusMeta(item.status).accent"
+            @click="copyText(buildHistorySummaryText(item), '操作摘要已复制')"
+          >
+            <div class="flex items-start justify-between gap-3">
+              <div class="min-w-0">
+                <div class="line-clamp-1 text-sm font-semibold">
+                  {{ item.actionLabel }}
+                </div>
+                <div class="mt-1 text-xs opacity-80">
+                  {{ formatActionTime(item.timestamp) }}
+                </div>
+              </div>
+              <div class="text-base" :class="getActionHistoryStatusMeta(item.status).icon" />
+            </div>
+            <p class="line-clamp-3 mt-3 text-xs leading-5 opacity-90">
+              {{ buildActionResultMessage(item.actionLabel, item.successCount, item.failedNames, item.skippedCount) }}
+            </p>
+            <div class="mt-3 flex flex-wrap gap-2 text-[11px]">
+              <span class="rounded-full bg-black/15 px-2.5 py-1">总计 {{ item.totalCount }}</span>
+              <span class="rounded-full bg-black/15 px-2.5 py-1">成功 {{ item.successCount }}</span>
+              <span class="rounded-full bg-black/15 px-2.5 py-1">失败 {{ item.failedCount }}</span>
+            </div>
+            <div class="mt-auto pt-3 text-[11px] opacity-75">
+              {{ item.targetLabel || '点击复制本次摘要' }}
+            </div>
+          </button>
+        </div>
+      </template>
+    </BaseHistorySummaryPanel>
 
     <div v-if="loading && accounts.length === 0" class="glass-panel min-h-[300px] flex flex-col items-center justify-center rounded-lg py-12 text-center shadow">
       <div class="relative mb-6">
@@ -2047,27 +2133,31 @@ useIntervalFn(() => {
       </p>
     </div>
 
-    <div v-else-if="accounts.length === 0" class="glass-panel rounded-lg py-12 text-center shadow">
-      <div i-carbon-user-avatar class="glass-text-muted mb-4 inline-block text-4xl" />
-      <p class="glass-text-muted mb-4">
-        暂无账号
-      </p>
+    <BaseEmptyState v-else-if="accounts.length === 0" class="glass-panel rounded-lg shadow" icon="i-carbon-user-avatar">
+      <template #title>
+        <p class="ui-empty-state__title glass-text-muted mb-4">
+          暂无账号
+        </p>
+      </template>
       <BaseButton
         variant="text"
         @click="openAddModal"
       >
         立即添加
       </BaseButton>
-    </div>
+    </BaseEmptyState>
 
-    <div v-else-if="filteredAccounts.length === 0" class="glass-panel rounded-2xl py-14 text-center shadow">
-      <div class="i-carbon-search-locate glass-text-muted mb-4 inline-block text-4xl" />
-      <p class="text-base font-semibold">
-        没有符合当前筛选条件的账号
-      </p>
-      <p class="glass-text-muted mt-2 text-sm">
-        可以调整归属胶囊、搜索关键词或状态筛选，再继续查看。
-      </p>
+    <BaseEmptyState v-else-if="filteredAccounts.length === 0" class="glass-panel rounded-2xl shadow" icon="i-carbon-search-locate">
+      <template #title>
+        <p class="ui-empty-state__title text-base font-semibold">
+          没有符合当前筛选条件的账号
+        </p>
+      </template>
+      <template #description>
+        <p class="ui-empty-state__desc glass-text-muted mt-2 text-sm">
+          可以调整归属胶囊、搜索关键词或状态筛选，再继续查看。
+        </p>
+      </template>
       <BaseButton
         variant="ghost"
         class="mt-4"
@@ -2075,24 +2165,31 @@ useIntervalFn(() => {
       >
         清空筛选
       </BaseButton>
-    </div>
+    </BaseEmptyState>
 
-    <div v-else-if="isTableView" class="glass-panel overflow-hidden rounded-[26px]">
-      <div class="flex flex-col gap-3 border-b border-white/8 px-4 py-4 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h3 class="text-base font-semibold">
+    <div v-else-if="isTableView" class="glass-panel ui-table-card rounded-[26px]">
+      <BaseSectionHeader class="px-4 py-4">
+        <template #title>
+          <h3 class="ui-section-head__title text-base font-semibold">
             表格视图
           </h3>
-          <p class="glass-text-muted mt-1 text-sm">
+        </template>
+        <template #description>
+          <p class="ui-section-head__desc glass-text-muted mt-1 text-sm">
             适合批量盘点账号归属、平台、最近登录时间和操作状态。
           </p>
-        </div>
-        <div class="flex flex-wrap items-center gap-2">
-          <div class="border border-white/8 rounded-full bg-black/10 px-3 py-1.5 text-xs text-gray-300">
+        </template>
+        <div class="ui-section-meta">
+          <div class="border border-white/8 rounded-full bg-black/10 px-3 py-1.5 text-xs text-gray-200">
             当前排序：{{ currentTableSortLabel }}
           </div>
-          <div class="border border-white/8 rounded-full bg-black/10 px-3 py-1.5 text-xs text-gray-300">
-            当前筛选 {{ filteredAccounts.length }} 项，已选 {{ selectedAccountIds.length }} 项
+          <BaseSelectionSummary
+            :selected-count="selectedAccountIds.length"
+            :filtered-count="filteredAccounts.length"
+            variant="pill"
+          />
+          <div class="border border-sky-200/60 rounded-full bg-sky-50/70 px-3 py-1.5 text-xs text-sky-700 dark:border-sky-800/40 dark:bg-sky-900/15 dark:text-sky-200">
+            {{ TABLE_VIEW_SYNC_NOTE }}
           </div>
           <div class="relative" @click.stop>
             <BaseButton
@@ -2111,6 +2208,9 @@ useIntervalFn(() => {
               <div class="mb-2 text-xs text-gray-400 tracking-[0.18em] uppercase">
                 表格列显隐
               </div>
+              <div class="mb-2 rounded-xl bg-sky-50/70 px-3 py-2 text-[11px] text-sky-700 leading-5 dark:bg-sky-900/15 dark:text-sky-200">
+                {{ TABLE_COLUMN_SYNC_NOTE }}
+              </div>
               <button
                 v-for="column in tableColumnOptions"
                 :key="column.key"
@@ -2128,251 +2228,239 @@ useIntervalFn(() => {
             </div>
           </div>
         </div>
-      </div>
+      </BaseSectionHeader>
 
-      <div class="max-h-[68vh] overflow-auto">
-        <table class="min-w-[1260px] w-full text-sm">
-          <thead class="sticky top-0 z-10 bg-[rgba(48,14,32,0.96)] text-left text-[11px] text-gray-400 tracking-[0.18em] uppercase backdrop-blur-md">
-            <tr>
-              <th class="px-4 py-3 font-medium">
-                选择
-              </th>
-              <th class="px-4 py-3 font-medium">
-                <button class="inline-flex items-center gap-1.5 transition-colors hover:text-white" @click="toggleTableSort('account')">
-                  账号
-                  <div class="text-xs" :class="getTableSortIcon('account')" />
-                </button>
-              </th>
-              <th v-if="visibleTableColumns.owner" class="px-4 py-3 font-medium">
-                <button class="inline-flex items-center gap-1.5 transition-colors hover:text-white" @click="toggleTableSort('owner')">
-                  归属
-                  <div class="text-xs" :class="getTableSortIcon('owner')" />
-                </button>
-              </th>
-              <th v-if="visibleTableColumns.platform" class="px-4 py-3 font-medium">
-                <button class="inline-flex items-center gap-1.5 transition-colors hover:text-white" @click="toggleTableSort('platform')">
-                  平台 / 区服
-                  <div class="text-xs" :class="getTableSortIcon('platform')" />
-                </button>
-              </th>
-              <th v-if="visibleTableColumns.activity" class="px-4 py-3 font-medium">
-                <button class="inline-flex items-center gap-1.5 transition-colors hover:text-white" @click="toggleTableSort('activity')">
-                  最近登录
-                  <div class="text-xs" :class="getTableSortIcon('activity')" />
-                </button>
-              </th>
-              <th v-if="visibleTableColumns.mode" class="px-4 py-3 font-medium">
-                <button class="inline-flex items-center gap-1.5 transition-colors hover:text-white" @click="toggleTableSort('mode')">
-                  模式
-                  <div class="text-xs" :class="getTableSortIcon('mode')" />
-                </button>
-              </th>
-              <th v-if="visibleTableColumns.state" class="px-4 py-3 font-medium">
-                <button class="inline-flex items-center gap-1.5 transition-colors hover:text-white" @click="toggleTableSort('state')">
-                  状态
-                  <div class="text-xs" :class="getTableSortIcon('state')" />
-                </button>
-              </th>
-              <th v-if="visibleTableColumns.actions" class="px-4 py-3 font-medium">
-                操作
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr
-              v-for="acc in tableAccounts"
-              :key="acc.id"
-              class="cursor-pointer border-t border-white/8 align-top transition-colors hover:bg-white/[0.03]"
-              :class="String(acc.id || '') === String(accountStore.currentAccountId || '') ? 'bg-primary-500/[0.05]' : ''"
-              @click="accountStore.selectAccount(String(acc.id || ''))"
-            >
-              <td class="px-4 py-4 align-top">
-                <div
-                  class="h-5 w-5 flex cursor-pointer items-center justify-center border rounded transition-colors"
-                  :class="isSelected(acc.id) ? 'bg-primary-500 border-primary-500' : 'border-gray-300/50 bg-black/5 dark:border-gray-600 dark:bg-white/5'"
-                  @click.stop="toggleSelection(acc.id)"
-                >
-                  <div v-if="isSelected(acc.id)" class="i-carbon-checkmark text-white" />
+      <BaseDataTable class="max-h-[68vh] overflow-auto" table-class="min-w-[1260px] w-full text-sm">
+        <BaseDataTableHead class="accounts-table-head sticky top-0 z-10 text-left text-[11px] text-gray-400 tracking-[0.18em] uppercase backdrop-blur-md">
+          <tr>
+            <th class="px-4 py-3 font-medium">
+              选择
+            </th>
+            <BaseSortableHeaderCell
+              label="账号"
+              :active="tableSortKey === 'account'"
+              :direction="tableSortDirection"
+              @toggle="toggleTableSort('account')"
+            />
+            <BaseSortableHeaderCell
+              v-if="visibleTableColumns.owner"
+              label="归属"
+              :active="tableSortKey === 'owner'"
+              :direction="tableSortDirection"
+              @toggle="toggleTableSort('owner')"
+            />
+            <BaseSortableHeaderCell
+              v-if="visibleTableColumns.platform"
+              label="平台 / 区服"
+              :active="tableSortKey === 'platform'"
+              :direction="tableSortDirection"
+              @toggle="toggleTableSort('platform')"
+            />
+            <BaseSortableHeaderCell
+              v-if="visibleTableColumns.activity"
+              label="最近登录"
+              :active="tableSortKey === 'activity'"
+              :direction="tableSortDirection"
+              @toggle="toggleTableSort('activity')"
+            />
+            <BaseSortableHeaderCell
+              v-if="visibleTableColumns.mode"
+              label="模式"
+              :active="tableSortKey === 'mode'"
+              :direction="tableSortDirection"
+              @toggle="toggleTableSort('mode')"
+            />
+            <BaseSortableHeaderCell
+              v-if="visibleTableColumns.state"
+              label="状态"
+              :active="tableSortKey === 'state'"
+              :direction="tableSortDirection"
+              @toggle="toggleTableSort('state')"
+            />
+            <th v-if="visibleTableColumns.actions" class="px-4 py-3 font-medium">
+              操作
+            </th>
+          </tr>
+        </BaseDataTableHead>
+        <tbody>
+          <tr
+            v-for="acc in tableAccounts"
+            :key="acc.id"
+            class="cursor-pointer border-t border-white/8 align-top transition-colors hover:bg-white/[0.03]"
+            :class="String(acc.id || '') === String(accountStore.currentAccountId || '') ? 'bg-primary-500/[0.05]' : ''"
+            @click="accountStore.selectAccount(String(acc.id || ''))"
+          >
+            <td class="px-4 py-4 align-top">
+              <div
+                class="h-5 w-5 flex cursor-pointer items-center justify-center border rounded transition-colors"
+                :class="isSelected(acc.id) ? 'bg-primary-500 border-primary-500' : 'border-gray-300/50 bg-black/5 dark:border-gray-600 dark:bg-white/5'"
+                @click.stop="toggleSelection(acc.id)"
+              >
+                <div v-if="isSelected(acc.id)" class="i-carbon-checkmark text-white" />
+              </div>
+            </td>
+            <td class="px-4 py-4 align-top">
+              <div class="min-w-[220px] flex items-start gap-3">
+                <div class="h-11 w-11 flex shrink-0 items-center justify-center overflow-hidden border border-white/10 rounded-xl bg-black/10">
+                  <img v-if="getAvatarUrl(acc)" :src="getAvatarUrl(acc)" class="h-full w-full object-cover" @error="(e) => markFailed((e.target as HTMLImageElement).src)" />
+                  <div v-else class="i-carbon-user glass-text-muted text-2xl" />
                 </div>
-              </td>
-              <td class="px-4 py-4 align-top">
-                <div class="min-w-[220px] flex items-start gap-3">
-                  <div class="h-11 w-11 flex shrink-0 items-center justify-center overflow-hidden border border-white/10 rounded-xl bg-black/10">
-                    <img v-if="getAvatarUrl(acc)" :src="getAvatarUrl(acc)" class="h-full w-full object-cover" @error="(e) => markFailed((e.target as HTMLImageElement).src)">
-                    <div v-else class="i-carbon-user glass-text-muted text-2xl" />
+                <div class="min-w-0">
+                  <div class="line-clamp-1 text-base font-semibold">
+                    {{ getAccountDisplayName(acc) }}
                   </div>
-                  <div class="min-w-0">
-                    <div class="line-clamp-1 text-base font-semibold">
-                      {{ getAccountDisplayName(acc) }}
-                    </div>
-                    <div class="glass-text-muted line-clamp-1 mt-1 text-xs">
-                      {{ getAccountSubline(acc) }}
-                    </div>
-                    <div class="glass-text-muted line-clamp-1 mt-1 text-xs">
-                      昵称：{{ acc.nick || '暂无昵称' }}
-                    </div>
+                  <div class="glass-text-muted line-clamp-1 mt-1 text-xs">
+                    {{ getAccountSubline(acc) }}
                   </div>
-                </div>
-              </td>
-              <td v-if="visibleTableColumns.owner" class="px-4 py-4 align-top">
-                <div class="min-w-[180px]">
-                  <span class="inline-flex rounded-full px-2.5 py-1 text-xs font-semibold" :class="resolveOwnerMeta(acc).badge">
-                    {{ resolveOwnerMeta(acc).shortLabel }}
-                  </span>
-                  <div class="line-clamp-2 mt-2 text-sm font-semibold leading-6">
-                    {{ resolveOwnerMeta(acc).ownerText }}
+                  <div class="glass-text-muted line-clamp-1 mt-1 text-xs">
+                    昵称：{{ acc.nick || '暂无昵称' }}
                   </div>
                 </div>
-              </td>
-              <td v-if="visibleTableColumns.platform" class="px-4 py-4 align-top">
-                <div class="min-w-[140px]">
-                  <div class="text-sm font-semibold">
-                    {{ resolvePlatformLabel(acc.platform) }}
-                  </div>
-                  <div class="glass-text-muted mt-2 text-xs">
-                    {{ resolveZoneLabel(acc) }}
-                  </div>
+              </div>
+            </td>
+            <td v-if="visibleTableColumns.owner" class="px-4 py-4 align-top">
+              <div class="min-w-[180px]">
+                <BaseBadge :class="resolveOwnerMeta(acc).badge">
+                  {{ resolveOwnerMeta(acc).shortLabel }}
+                </BaseBadge>
+                <div class="line-clamp-2 mt-2 text-sm font-semibold leading-6">
+                  {{ resolveOwnerMeta(acc).ownerText }}
                 </div>
-              </td>
-              <td v-if="visibleTableColumns.activity" class="px-4 py-4 align-top">
-                <div class="min-w-[168px]">
-                  <div class="text-sm font-semibold leading-6">
-                    {{ getLastLoginLabel(acc) }}
-                  </div>
-                  <div class="glass-text-muted mt-2 text-xs leading-5">
-                    首次录入 {{ formatDateTime(acc.createdAt) }}
-                  </div>
+              </div>
+            </td>
+            <td v-if="visibleTableColumns.platform" class="px-4 py-4 align-top">
+              <div class="min-w-[140px]">
+                <div class="text-sm font-semibold">
+                  {{ resolvePlatformLabel(acc.platform) }}
                 </div>
-              </td>
-              <td v-if="visibleTableColumns.mode" class="px-4 py-4 align-top">
-                <div class="min-w-[188px]">
-                  <span class="inline-flex rounded-full px-2.5 py-1 text-xs font-semibold" :class="resolveModeMeta(resolveAccountMode(acc)).badge">
-                    {{ resolveModeMeta(resolveAccountMode(acc)).label }}
-                  </span>
-                  <div v-if="resolveModeExecutionMeta(acc)" class="mt-2 flex flex-wrap items-center gap-2">
-                    <span class="inline-flex rounded-full px-2.5 py-1 text-xs font-semibold" :class="resolveModeExecutionMeta(acc)?.badge">
-                      {{ resolveModeExecutionMeta(acc)?.label }}
-                    </span>
-                  </div>
-                  <div v-if="resolveModeExecutionMeta(acc)?.note" class="mt-2 text-xs leading-5" :class="resolveModeExecutionMeta(acc)?.noteClass">
-                    {{ resolveModeExecutionMeta(acc)?.note }}
-                  </div>
-                  <div class="mt-3 flex items-center gap-0.5 border border-gray-200/50 rounded-full bg-black/[0.04] p-1 shadow-inner dark:border-gray-700/50 dark:bg-white/[0.03]" @click.stop>
-                    <button
-                      class="cursor-pointer rounded-full px-3 py-1.5 text-xs font-medium transition-all"
-                      :class="getModeButtonClasses(acc, 'main')"
-                      title="设为主号"
-                      @click="handleModeChange(acc, 'main')"
-                    >
-                      主号
-                    </button>
-                    <button
-                      class="cursor-pointer rounded-full px-3 py-1.5 text-xs font-medium transition-all"
-                      :class="getModeButtonClasses(acc, 'alt')"
-                      title="设为小号"
-                      @click="handleModeChange(acc, 'alt')"
-                    >
-                      小号
-                    </button>
-                    <button
-                      class="cursor-pointer rounded-full px-3 py-1.5 text-xs font-medium transition-all"
-                      :class="getModeButtonClasses(acc, 'safe')"
-                      title="设为风险规避"
-                      @click="handleModeChange(acc, 'safe')"
-                    >
-                      避险
-                    </button>
-                  </div>
+                <div class="glass-text-muted mt-2 text-xs">
+                  {{ resolveZoneLabel(acc) }}
                 </div>
-              </td>
-              <td v-if="visibleTableColumns.state" class="px-4 py-4 align-top">
-                <div class="min-w-[170px]">
-                  <span class="inline-flex rounded-full px-2.5 py-1 text-xs font-semibold" :class="resolveRuntimeState(acc).badge">
-                    {{ resolveRuntimeState(acc).label }}
-                  </span>
-                  <div v-if="acc.wsError?.message" class="line-clamp-2 mt-2 border border-red-500/15 rounded-2xl bg-red-500/10 px-3 py-2 text-xs text-red-300 leading-5">
-                    最近错误：{{ acc.wsError.message }}
-                  </div>
-                  <div v-else class="glass-text-muted mt-2 text-xs leading-5">
-                    {{ String(acc.id || '') === String(accountStore.currentAccountId || '') ? '当前选中账号，可继续进入设置调整。' : '暂无异常记录。' }}
-                  </div>
+              </div>
+            </td>
+            <td v-if="visibleTableColumns.activity" class="px-4 py-4 align-top">
+              <div class="min-w-[168px]">
+                <div class="text-sm font-semibold leading-6">
+                  {{ getLastLoginLabel(acc) }}
                 </div>
-              </td>
-              <td v-if="visibleTableColumns.actions" class="px-4 py-4 align-top">
-                <div class="min-w-[218px] space-y-3" @click.stop>
-                  <div class="flex flex-wrap items-center gap-2">
-                    <BaseButton
-                      variant="secondary"
-                      size="sm"
-                      class="min-w-[84px] border rounded-full shadow-sm transition-all duration-500 ease-in-out active:scale-95"
-                      :class="acc.running ? 'border-red-500/20 bg-red-500/10 text-red-600 hover:bg-red-500/20 focus:ring-red-500/50 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400 dark:hover:bg-red-500/20' : 'border-green-500/20 bg-green-500/10 text-green-600 hover:bg-green-500/20 focus:ring-green-500/50 dark:border-green-500/30 dark:bg-green-500/10 dark:text-green-400 dark:hover:bg-green-500/20'"
-                      @click.stop="toggleAccount(acc)"
-                    >
-                      <div :class="acc.running ? 'i-carbon-stop-filled' : 'i-carbon-play-filled'" class="mr-1" />
-                      {{ acc.running ? '停止' : '启动' }}
-                    </BaseButton>
+                <div class="glass-text-muted mt-2 text-xs leading-5">
+                  首次录入 {{ formatDateTime(acc.createdAt) }}
+                </div>
+              </div>
+            </td>
+            <td v-if="visibleTableColumns.mode" class="px-4 py-4 align-top">
+              <div class="min-w-[188px]">
+                <BaseBadge :class="resolveModeMeta(resolveAccountMode(acc)).badge">
+                  {{ resolveModeMeta(resolveAccountMode(acc)).label }}
+                </BaseBadge>
+                <div v-if="resolveModeExecutionMeta(acc)" class="mt-2 flex flex-wrap items-center gap-2">
+                  <BaseBadge :class="resolveModeExecutionMeta(acc)?.badge">
+                    {{ resolveModeExecutionMeta(acc)?.label }}
+                  </BaseBadge>
+                </div>
+                <div v-if="resolveModeExecutionMeta(acc)?.note" class="mt-2 text-xs leading-5" :class="resolveModeExecutionMeta(acc)?.noteClass">
+                  {{ resolveModeExecutionMeta(acc)?.note }}
+                </div>
+                <div class="mt-3 flex items-center gap-0.5 border border-gray-200/50 rounded-full bg-black/[0.04] p-1 shadow-inner dark:border-gray-700/50 dark:bg-white/[0.03]" @click.stop>
+                  <button
+                    class="cursor-pointer rounded-full px-3 py-1.5 text-xs font-medium transition-all"
+                    :class="getModeButtonClasses(acc, 'main')"
+                    title="设为主号"
+                    @click="handleModeChange(acc, 'main')"
+                  >
+                    主号
+                  </button>
+                  <button
+                    class="cursor-pointer rounded-full px-3 py-1.5 text-xs font-medium transition-all"
+                    :class="getModeButtonClasses(acc, 'alt')"
+                    title="设为小号"
+                    @click="handleModeChange(acc, 'alt')"
+                  >
+                    小号
+                  </button>
+                  <button
+                    class="cursor-pointer rounded-full px-3 py-1.5 text-xs font-medium transition-all"
+                    :class="getModeButtonClasses(acc, 'safe')"
+                    title="设为风险规避"
+                    @click="handleModeChange(acc, 'safe')"
+                  >
+                    避险
+                  </button>
+                </div>
+              </div>
+            </td>
+            <td v-if="visibleTableColumns.state" class="px-4 py-4 align-top">
+              <div class="min-w-[170px]">
+                <BaseBadge :class="resolveRuntimeState(acc).badge">
+                  {{ resolveRuntimeState(acc).label }}
+                </BaseBadge>
+                <div v-if="acc.wsError?.message" class="line-clamp-2 mt-2 border border-red-500/15 rounded-2xl bg-red-500/10 px-3 py-2 text-xs text-red-300 leading-5">
+                  最近错误：{{ acc.wsError.message }}
+                </div>
+                <div v-else class="glass-text-muted mt-2 text-xs leading-5">
+                  {{ String(acc.id || '') === String(accountStore.currentAccountId || '') ? '当前选中账号，可继续进入设置调整。' : '暂无异常记录。' }}
+                </div>
+              </div>
+            </td>
+            <td v-if="visibleTableColumns.actions" class="px-4 py-4 align-top">
+              <div class="min-w-[218px] space-y-3" @click.stop>
+                <div class="flex flex-wrap items-center gap-2">
+                  <BaseButton
+                    variant="secondary"
+                    size="sm"
+                    class="min-w-[84px] border rounded-full shadow-sm transition-all duration-500 ease-in-out active:scale-95"
+                    :class="acc.running ? 'border-red-500/20 bg-red-500/10 text-red-600 hover:bg-red-500/20 focus:ring-red-500/50 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-400 dark:hover:bg-red-500/20' : 'border-green-500/20 bg-green-500/10 text-green-600 hover:bg-green-500/20 focus:ring-green-500/50 dark:border-green-500/30 dark:bg-green-500/10 dark:text-green-400 dark:hover:bg-green-500/20'"
+                    @click.stop="toggleAccount(acc)"
+                  >
+                    <div :class="acc.running ? 'i-carbon-stop-filled' : 'i-carbon-play-filled'" class="mr-1" />
+                    {{ acc.running ? '停止' : '启动' }}
+                  </BaseButton>
 
-                    <BaseButton
-                      v-if="resolveAccountMode(acc) === 'safe'"
-                      variant="ghost"
-                      size="sm"
-                      class="rounded-full bg-emerald-500/10 text-emerald-600 hover:bg-emerald-500/20 !px-3 !py-1.5 !text-xs dark:text-emerald-400"
-                      title="一键分析封禁日志并加入黑名单"
-                      :loading="safeCheckingId === acc.id"
-                      @click.stop="handleSafeCheck(acc)"
-                    >
-                      <div class="i-carbon-security mr-1" />
-                      防封扫描
-                    </BaseButton>
-                  </div>
-
-                  <div class="flex items-center gap-2">
-                    <BaseButton
-                      variant="ghost"
-                      class="border border-white/8 rounded-full bg-black/10 hover:bg-white/8 !p-2.5"
-                      title="设置"
-                      @click.stop="openSettings(acc)"
-                    >
-                      <div class="i-carbon-settings text-lg" />
-                    </BaseButton>
-                    <BaseButton
-                      variant="ghost"
-                      class="border border-white/8 rounded-full bg-black/10 hover:bg-white/8 !p-2.5"
-                      title="编辑"
-                      @click.stop="openEditModal(acc)"
-                    >
-                      <div class="i-carbon-edit text-lg" />
-                    </BaseButton>
-                    <BaseButton
-                      variant="ghost"
-                      class="border border-red-500/20 rounded-full bg-red-500/8 text-red-500 hover:bg-red-500/14 !p-2.5 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300"
-                      title="删除"
-                      @click.stop="handleDelete(acc)"
-                    >
-                      <div class="i-carbon-trash-can text-lg" />
-                    </BaseButton>
-                  </div>
+                  <BaseButton
+                    v-if="resolveAccountMode(acc) === 'safe'"
+                    variant="ghost"
+                    size="sm"
+                    class="rounded-full bg-emerald-500/10 text-emerald-600 hover:bg-emerald-500/20 !px-3 !py-1.5 !text-xs dark:text-emerald-400"
+                    title="一键分析封禁日志并加入黑名单"
+                    :loading="safeCheckingId === acc.id"
+                    @click.stop="handleSafeCheck(acc)"
+                  >
+                    <div class="i-carbon-security mr-1" />
+                    防封扫描
+                  </BaseButton>
                 </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
+
+                <div class="flex items-center gap-2">
+                  <BaseIconAction class="!p-2.5" title="设置" @click.stop="openSettings(acc)">
+                    <div class="i-carbon-settings text-lg" />
+                  </BaseIconAction>
+                  <BaseIconAction class="!p-2.5" title="编辑" @click.stop="openEditModal(acc)">
+                    <div class="i-carbon-edit text-lg" />
+                  </BaseIconAction>
+                  <BaseIconAction danger class="!p-2.5 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300" title="删除" @click.stop="handleDelete(acc)">
+                    <div class="i-carbon-trash-can text-lg" />
+                  </BaseIconAction>
+                </div>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </BaseDataTable>
     </div>
 
     <div v-else :class="cardGridClass">
       <div
         v-for="acc in filteredAccounts"
         :key="acc.id"
-        class="glass-panel group relative h-full flex flex-col cursor-pointer overflow-hidden border shadow-[0_20px_60px_rgba(15,23,42,0.18)] transition-all duration-300"
+        class="accounts-card-shell glass-panel group relative h-full flex flex-col cursor-pointer overflow-hidden border transition-all duration-300"
         :class="[
           isCompactView ? 'min-h-[392px] rounded-[22px] p-4' : 'min-h-[452px] rounded-[26px] p-5',
-          String(acc.id || '') === String(accountStore.currentAccountId || '') ? 'border-primary-500/55 bg-primary-500/[0.05] shadow-[0_0_28px_rgba(var(--color-primary-500),0.18)] dark:border-primary-400/50' : 'border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.06),rgba(255,255,255,0.02))]',
+          String(acc.id || '') === String(accountStore.currentAccountId || '') ? 'accounts-card-current border-primary-500/55 bg-primary-500/[0.05] dark:border-primary-400/50' : 'accounts-card-idle border-white/10',
           resolveOwnerMeta(acc).cardGlow,
         ]"
         @click="accountStore.selectAccount(String(acc.id || ''))"
       >
-        <div class="pointer-events-none absolute inset-x-0 top-0 bg-[radial-gradient(circle_at_top_left,rgba(255,255,255,0.14),transparent_62%)] opacity-80" :class="isCompactView ? 'h-24' : 'h-30'" />
+        <div class="accounts-card-overlay pointer-events-none absolute inset-x-0 top-0 opacity-80" :class="isCompactView ? 'h-24' : 'h-30'" />
 
         <div class="relative flex items-start justify-between gap-4 pl-8" :class="isCompactView ? 'min-h-[104px]' : 'min-h-[124px]'">
           <div
@@ -2385,23 +2473,17 @@ useIntervalFn(() => {
 
           <div class="min-w-0 flex flex-1 items-start gap-4">
             <div class="flex shrink-0 items-center justify-center overflow-hidden border border-white/10 bg-black/10 shadow-inner dark:bg-white/10" :class="isCompactView ? 'h-12 w-12 rounded-xl' : 'h-14 w-14 rounded-2xl'">
-              <img v-if="getAvatarUrl(acc)" :src="getAvatarUrl(acc)" class="h-full w-full object-cover" @error="(e) => markFailed((e.target as HTMLImageElement).src)">
+              <img v-if="getAvatarUrl(acc)" :src="getAvatarUrl(acc)" class="h-full w-full object-cover" @error="(e) => markFailed((e.target as HTMLImageElement).src)" />
               <div v-else class="i-carbon-user glass-text-muted" :class="isCompactView ? 'text-2xl' : 'text-3xl'" />
             </div>
             <div class="min-w-0 flex-1 pt-0.5">
               <div class="flex flex-wrap items-center gap-2">
-                <span
-                  class="inline-flex rounded-full px-2.5 py-1 text-[11px] font-semibold tracking-[0.12em] uppercase"
-                  :class="resolveOwnerMeta(acc).badge"
-                >
+                <BaseBadge class="text-[11px] tracking-[0.12em] uppercase" :class="resolveOwnerMeta(acc).badge">
                   {{ resolveOwnerMeta(acc).shortLabel }}
-                </span>
-                <span
-                  class="inline-flex rounded-full px-2.5 py-1 text-[11px] font-semibold tracking-[0.12em] uppercase"
-                  :class="resolveRuntimeState(acc).badge"
-                >
+                </BaseBadge>
+                <BaseBadge class="text-[11px] tracking-[0.12em] uppercase" :class="resolveRuntimeState(acc).badge">
                   {{ resolveRuntimeState(acc).label }}
-                </span>
+                </BaseBadge>
               </div>
               <h3 class="line-clamp-1 mt-3 font-semibold leading-tight" :class="isCompactView ? 'text-lg' : 'text-xl'" :title="getAccountDisplayName(acc)">
                 {{ getAccountDisplayName(acc) }}
@@ -2441,9 +2523,9 @@ useIntervalFn(() => {
               归属账号
             </div>
             <div class="mt-3 flex items-center gap-2">
-              <span class="inline-flex rounded-full px-2.5 py-1 text-xs font-semibold" :class="resolveOwnerMeta(acc).badge">
+              <BaseBadge :class="resolveOwnerMeta(acc).badge">
                 {{ resolveOwnerMeta(acc).shortLabel }}
-              </span>
+              </BaseBadge>
             </div>
             <div class="line-clamp-2 mt-3 text-sm font-semibold leading-6">
               {{ resolveOwnerMeta(acc).ownerText }}
@@ -2485,17 +2567,17 @@ useIntervalFn(() => {
                   <div class="h-2 w-2 rounded-full" :class="resolveRuntimeState(acc).dot" />
                   {{ resolveRuntimeState(acc).label }}
                 </span>
-                <span class="border border-white/8 rounded-full bg-black/10 px-2.5 py-1 text-xs text-gray-300">
+                <span class="border border-white/8 rounded-full bg-black/10 px-2.5 py-1 text-xs text-gray-200">
                   平台：{{ resolvePlatformLabel(acc.platform) }}
                 </span>
               </div>
               <div class="mt-2 flex flex-wrap items-center gap-2">
-                <span class="inline-flex rounded-full px-2.5 py-1 text-xs font-semibold" :class="resolveModeMeta(resolveAccountMode(acc)).badge">
+                <BaseBadge :class="resolveModeMeta(resolveAccountMode(acc)).badge">
                   配置: {{ resolveModeMeta(resolveAccountMode(acc)).label }}
-                </span>
-                <span v-if="resolveModeExecutionMeta(acc)" class="inline-flex rounded-full px-2.5 py-1 text-xs font-semibold" :class="resolveModeExecutionMeta(acc)?.badge">
+                </BaseBadge>
+                <BaseBadge v-if="resolveModeExecutionMeta(acc)" :class="resolveModeExecutionMeta(acc)?.badge">
                   {{ resolveModeExecutionMeta(acc)?.label }}
-                </span>
+                </BaseBadge>
               </div>
               <p v-if="resolveModeExecutionMeta(acc)?.note" class="mt-2 text-xs leading-5" :class="resolveModeExecutionMeta(acc)?.noteClass">
                 {{ resolveModeExecutionMeta(acc)?.note }}
@@ -2556,30 +2638,15 @@ useIntervalFn(() => {
             </div>
 
             <div class="flex items-center gap-2">
-              <BaseButton
-                variant="ghost"
-                class="border border-white/8 rounded-full bg-black/10 hover:bg-white/8 !p-2.5"
-                title="设置"
-                @click.stop="openSettings(acc)"
-              >
+              <BaseIconAction class="!p-2.5" title="设置" @click.stop="openSettings(acc)">
                 <div class="i-carbon-settings text-lg" />
-              </BaseButton>
-              <BaseButton
-                variant="ghost"
-                class="border border-white/8 rounded-full bg-black/10 hover:bg-white/8 !p-2.5"
-                title="编辑"
-                @click.stop="openEditModal(acc)"
-              >
+              </BaseIconAction>
+              <BaseIconAction class="!p-2.5" title="编辑" @click.stop="openEditModal(acc)">
                 <div class="i-carbon-edit text-lg" />
-              </BaseButton>
-              <BaseButton
-                variant="ghost"
-                class="border border-red-500/20 rounded-full bg-red-500/8 text-red-500 hover:bg-red-500/14 !p-2.5 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300"
-                title="删除"
-                @click.stop="handleDelete(acc)"
-              >
+              </BaseIconAction>
+              <BaseIconAction danger class="!p-2.5 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300" title="删除" @click.stop="handleDelete(acc)">
                 <div class="i-carbon-trash-can text-lg" />
-              </BaseButton>
+              </BaseIconAction>
             </div>
           </div>
         </div>
@@ -2617,3 +2684,87 @@ useIntervalFn(() => {
     />
   </div>
 </template>
+
+<style scoped>
+.accounts-page {
+  color: var(--ui-text-1);
+}
+
+.accounts-page :is(.text-gray-300, .text-gray-400, .text-gray-500, .glass-text-muted) {
+  color: var(--ui-text-2) !important;
+}
+
+.accounts-page :is(.text-gray-200, .text-gray-100, .text-slate-300, .text-slate-200) {
+  color: var(--ui-text-1) !important;
+}
+
+.accounts-page :is(.text-white\/95, .text-white\/90, .text-white\/85, .text-white\/80) {
+  color: color-mix(in srgb, var(--ui-text-1) 92%, var(--ui-text-on-brand) 8%) !important;
+}
+
+.accounts-page .accounts-tab-active {
+  box-shadow: 0 8px 24px var(--ui-shadow-panel) !important;
+}
+
+.accounts-page .accounts-mode-active {
+  box-shadow: 0 10px 26px var(--ui-shadow-panel) !important;
+}
+
+.accounts-page [class*='border-white/8'],
+.accounts-page [class*='border-white/10'],
+.accounts-page [class*='border-gray-200/50'],
+.accounts-page [class*='border-gray-700/50'] {
+  border-color: var(--ui-border-subtle) !important;
+}
+
+.accounts-page [class*='bg-black/10'],
+.accounts-page [class*='bg-black/8'],
+.accounts-page [class*='bg-black/[0.04]'],
+.accounts-page [class*='bg-white/12'],
+.accounts-page [class*='bg-white/10'] {
+  background: color-mix(in srgb, var(--ui-bg-surface) 58%, transparent) !important;
+}
+
+.accounts-page [class*='hover:bg-white/8']:hover,
+.accounts-page [class*='hover:bg-black/10']:hover,
+.accounts-page [class*='hover:bg-black/5']:hover {
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 72%, transparent) !important;
+}
+
+.accounts-page [class*='shadow-']:not([class*='shadow-inner']) {
+  box-shadow: 0 10px 26px var(--ui-shadow-panel) !important;
+}
+
+.accounts-page [class*='bg-primary-50/50'],
+.accounts-page [class*='bg-primary-500/[0.05]'] {
+  background: color-mix(in srgb, var(--ui-brand-500) 12%, transparent) !important;
+}
+
+.accounts-page .accounts-table-head {
+  background: color-mix(in srgb, var(--ui-bg-canvas) 90%, transparent) !important;
+}
+
+.accounts-page .accounts-card-shell {
+  box-shadow: 0 20px 52px var(--ui-shadow-panel) !important;
+}
+
+.accounts-page .accounts-card-current {
+  box-shadow: 0 0 24px color-mix(in srgb, var(--ui-brand-500) 20%, transparent) !important;
+}
+
+.accounts-page .accounts-card-idle {
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--ui-bg-surface-raised) 72%, transparent),
+    color-mix(in srgb, var(--ui-bg-surface) 82%, transparent)
+  ) !important;
+}
+
+.accounts-page .accounts-card-overlay {
+  background: radial-gradient(
+    circle at top left,
+    color-mix(in srgb, var(--ui-brand-500) 12%, transparent),
+    transparent 62%
+  ) !important;
+}
+</style>

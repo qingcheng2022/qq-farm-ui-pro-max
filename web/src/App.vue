@@ -1,15 +1,20 @@
 <script setup lang="ts">
-import { useStorage } from '@vueuse/core'
 import { computed, defineAsyncComponent, onMounted, ref, watch } from 'vue'
 import { RouterView, useRoute } from 'vue-router'
 import { useAppStore } from '@/stores/app'
 import { useStatusStore } from '@/stores/status'
 import { adminToken } from '@/utils/auth'
+import {
+  hydrateServerBackedStringPreference,
+  normalizeAppSeenVersion,
+  persistServerBackedStringPreference,
+} from '@/utils/view-preferences'
 
 // Async lazy load heavy components
 const NotificationModal = defineAsyncComponent(() => import('@/components/NotificationModal.vue'))
 const AnnouncementDialog = defineAsyncComponent(() => import('@/components/AnnouncementDialog.vue'))
 const ToastContainer = defineAsyncComponent(() => import('@/components/ToastContainer.vue'))
+const CopyFeedbackPopup = defineAsyncComponent(() => import('@/components/CopyFeedbackPopup.vue'))
 
 const appStore = useAppStore()
 const statusStore = useStatusStore()
@@ -17,7 +22,8 @@ const route = useRoute()
 
 // 全局更新弹窗逻辑
 const currentVersion = __APP_VERSION__
-const seenVersion = useStorage('app_seen_version', '')
+const APP_SEEN_VERSION_STORAGE_KEY = 'app_seen_version'
+const seenVersion = ref('')
 const showUpdateModal = ref(false)
 const hasCustomBackground = computed(() => !!appStore.loginBackground.trim())
 const isLoginRoute = computed(() => route.name === 'login')
@@ -32,32 +38,57 @@ const workspaceBackgroundStyle = computed(() => ({
   backgroundPosition: 'center',
 }))
 const workspaceBackgroundMaskStyle = computed(() => ({
-  backgroundColor: `rgba(8, 12, 24, ${appStore.appBackgroundOverlayOpacity / 100})`,
+  backgroundColor: `color-mix(in srgb, var(--ui-overlay-backdrop) ${appStore.appBackgroundOverlayOpacity}%, transparent)`,
   backdropFilter: `blur(${appStore.appBackgroundBlur}px)`,
   WebkitBackdropFilter: `blur(${appStore.appBackgroundBlur}px)`,
 }))
 
-onMounted(() => {
-  appStore.fetchUIConfig()
+async function hydrateSeenVersionPreference() {
+  seenVersion.value = await hydrateServerBackedStringPreference({
+    payloadKey: 'appSeenVersion',
+    localKey: APP_SEEN_VERSION_STORAGE_KEY,
+    normalize: normalizeAppSeenVersion,
+  })
+}
 
-  // 检查是否需要弹出版更公告
+function markCurrentVersionAsSeen() {
+  const normalizedVersion = normalizeAppSeenVersion(currentVersion, '')
+  seenVersion.value = normalizedVersion
+  void persistServerBackedStringPreference({
+    payloadKey: 'appSeenVersion',
+    localKey: APP_SEEN_VERSION_STORAGE_KEY,
+    value: normalizedVersion,
+    normalize: normalizeAppSeenVersion,
+  })
+}
+
+function syncUpdateModalVisibility() {
   if (seenVersion.value !== currentVersion) {
     showUpdateModal.value = true
-    seenVersion.value = currentVersion // 设定当前版本为已读
+    markCurrentVersionAsSeen()
   }
+}
+
+onMounted(async () => {
+  appStore.fetchUIConfig()
+  await hydrateSeenVersionPreference()
+  syncUpdateModalVisibility()
 })
 
-// === 后续优化：全局 Socket 生命周期管理 ===
-// 当 Token 被移除（用户点击退出或 Token 过期被拦截器清除）时，彻底断开 Socket 连接
-watch(adminToken, (newToken) => {
+watch(adminToken, async (newToken, oldToken) => {
   if (!newToken) {
     statusStore.disconnectRealtime()
+    return
+  }
+  if (newToken && !oldToken) {
+    await hydrateSeenVersionPreference()
+    syncUpdateModalVisibility()
   }
 })
 </script>
 
 <template>
-  <div class="relative z-0 h-screen w-screen overflow-hidden bg-theme-bg text-gray-700 transition-colors duration-300 dark:bg-theme-darkbg dark:text-gray-200">
+  <div class="ui-app-root relative z-0 h-screen w-screen overflow-hidden bg-theme-bg transition-colors duration-300 dark:bg-theme-darkbg">
     <div
       v-if="showWorkspaceBackground"
       class="app-scene-background"
@@ -81,7 +112,7 @@ watch(adminToken, (newToken) => {
           <template #fallback>
             <div class="h-screen w-screen flex flex-col items-center justify-center bg-theme-bg/80 backdrop-blur-sm dark:bg-theme-darkbg/80">
               <div class="i-carbon-circle-dash mb-4 h-12 w-12 animate-spin text-primary-500" />
-              <p class="text-gray-500 dark:text-gray-400">
+              <p class="ui-text-2">
                 正在按需分配计算层...
               </p>
             </div>
@@ -89,6 +120,7 @@ watch(adminToken, (newToken) => {
         </Suspense>
       </template>
     </RouterView>
+    <CopyFeedbackPopup />
     <ToastContainer class="relative z-50" />
     <!-- 全局首次更新大弹窗 -->
     <NotificationModal
@@ -107,6 +139,10 @@ body {
   margin: 0;
   font-family:
     'Avenir Next', 'Segoe UI Variable Text', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei UI', sans-serif;
+}
+
+.ui-app-root {
+  color: var(--ui-text-1);
 }
 
 .app-scene-background {
@@ -128,8 +164,13 @@ body {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(circle at 18% 18%, rgba(255, 255, 255, 0.08), transparent 36%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent 32%, rgba(0, 0, 0, 0.28));
+    radial-gradient(circle at 18% 18%, color-mix(in srgb, var(--ui-text-on-brand) 8%, transparent), transparent 36%),
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--ui-text-on-brand) 8%, transparent),
+      transparent 32%,
+      color-mix(in srgb, var(--ui-overlay-backdrop) 55%, transparent)
+    );
 }
 
 .mesh-bg.mesh-bg-muted {

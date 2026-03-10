@@ -14,7 +14,7 @@ const DB_PASS = process.env.MYSQL_PASSWORD || '123456';
 const DB_NAME = process.env.MYSQL_DATABASE || 'qq_farm_bot';
 const DB_LIMIT = Number.parseInt(process.env.MYSQL_POOL_LIMIT || '100', 10);
 
-if (!/^[a-zA-Z0-9_]+$/.test(DB_NAME)) {
+if (!/^\w+$/.test(DB_NAME)) {
     throw new Error(`Invalid MYSQL_DATABASE: "${DB_NAME}". Only alphanumeric and underscore allowed.`);
 }
 
@@ -41,8 +41,8 @@ const pool = mysql.createPool({
 let _initialized = false;
 
 /**
- * 获取连接池实时状态快照（用于监控和告警）
- * @returns {{ activeConnections: number, idleConnections: number, waitingQueue: number, connectionLimit: number }}
+ * 获取连接池实时状态快照（用于监控和告警）。
+ * @returns {{ activeConnections: number, idleConnections: number, waitingQueue: number, connectionLimit: number }} 连接池状态快照。
  */
 function getPoolStatus() {
     try {
@@ -53,13 +53,13 @@ function getPoolStatus() {
             waitingQueue: p._connectionQueue ? p._connectionQueue.length : 0,
             connectionLimit: DB_LIMIT,
         };
-    } catch (e) {
+    } catch {
         return { activeConnections: -1, idleConnections: -1, waitingQueue: -1, connectionLimit: DB_LIMIT };
     }
 }
 
 // 连接池使用率告警：每 30 秒检测，超过 80% 时输出 warn 日志
-setInterval(() => {
+const poolMonitorHandle = setInterval(() => {
     try {
         const status = getPoolStatus();
         if (status.activeConnections < 0) return;
@@ -67,10 +67,13 @@ setInterval(() => {
         if (usagePercent > 80) {
             logger.warn(`⚠️ 连接池使用率过高: ${usagePercent.toFixed(1)}% (活跃=${status.activeConnections}, 空闲=${status.idleConnections}, 排队=${status.waitingQueue}, 上限=${status.connectionLimit})`);
         }
-    } catch (e) {
+    } catch {
         // 监控本身不应影响业务
     }
-}, 30000).unref();
+}, 30000);
+if (poolMonitorHandle && typeof poolMonitorHandle.unref === 'function') {
+    poolMonitorHandle.unref();
+}
 
 async function runMigrationFile(sqlPath, description) {
     const fs = require('node:fs');
@@ -167,6 +170,14 @@ async function initMysql() {
                 await runMigrationFile(
                     path.join(migrationsDir, '012-card-management.sql'),
                     '检测到缺少 card_operation_logs 表，正在执行迁移 012-card-management.sql',
+                );
+            }
+
+            const [adminOperationLogTable] = await pool.execute(`SHOW TABLES LIKE 'admin_operation_logs'`);
+            if (adminOperationLogTable.length === 0) {
+                await runMigrationFile(
+                    path.join(migrationsDir, '014-admin-operation-logs.sql'),
+                    '检测到缺少 admin_operation_logs 表，正在执行迁移 014-admin-operation-logs.sql',
                 );
             }
 
@@ -304,6 +315,104 @@ async function initMysql() {
                     '检测到缺少 report_logs 表，正在执行迁移 011-report-logs.sql',
                 );
             }
+
+            const [systemSettingsTable] = await pool.execute(`SHOW TABLES LIKE 'system_settings'`);
+            if (systemSettingsTable.length === 0) {
+                await runMigrationFile(
+                    path.join(migrationsDir, '014-system-settings.sql'),
+                    '检测到缺少 system_settings 表，正在执行迁移 014-system-settings.sql',
+                );
+            }
+
+            const [userPreferencesTable] = await pool.execute(`SHOW TABLES LIKE 'user_preferences'`);
+            if (userPreferencesTable.length === 0) {
+                await runMigrationFile(
+                    path.join(migrationsDir, '015-user-preferences.sql'),
+                    '检测到缺少 user_preferences 表，正在执行迁移 015-user-preferences.sql',
+                );
+            }
+            const [confirmedUserPreferencesTable] = userPreferencesTable.length > 0
+                ? [userPreferencesTable]
+                : await pool.execute(`SHOW TABLES LIKE 'user_preferences'`);
+            if (confirmedUserPreferencesTable.length > 0) {
+                const userPreferenceColumnEnsures = [
+                    ['announcement_dismissed_id', "ALTER TABLE user_preferences ADD COLUMN announcement_dismissed_id VARCHAR(32) COLLATE utf8mb4_unicode_ci DEFAULT '' AFTER current_account_id", 'user_preferences.announcement_dismissed_id'],
+                    ['notification_last_read_date', "ALTER TABLE user_preferences ADD COLUMN notification_last_read_date VARCHAR(32) COLLATE utf8mb4_unicode_ci DEFAULT '' AFTER announcement_dismissed_id", 'user_preferences.notification_last_read_date'],
+                    ['app_seen_version', "ALTER TABLE user_preferences ADD COLUMN app_seen_version VARCHAR(64) COLLATE utf8mb4_unicode_ci DEFAULT '' AFTER notification_last_read_date", 'user_preferences.app_seen_version'],
+                    ['accounts_view_state', "ALTER TABLE user_preferences ADD COLUMN accounts_view_state JSON DEFAULT NULL AFTER app_seen_version", 'user_preferences.accounts_view_state'],
+                    ['accounts_action_history', "ALTER TABLE user_preferences ADD COLUMN accounts_action_history JSON DEFAULT NULL AFTER accounts_view_state", 'user_preferences.accounts_action_history'],
+                    ['dashboard_view_state', "ALTER TABLE user_preferences ADD COLUMN dashboard_view_state JSON DEFAULT NULL AFTER accounts_action_history", 'user_preferences.dashboard_view_state'],
+                    ['analytics_view_state', "ALTER TABLE user_preferences ADD COLUMN analytics_view_state JSON DEFAULT NULL AFTER dashboard_view_state", 'user_preferences.analytics_view_state'],
+                    ['report_history_view_state', "ALTER TABLE user_preferences ADD COLUMN report_history_view_state JSON DEFAULT NULL AFTER analytics_view_state", 'user_preferences.report_history_view_state'],
+                    ['cards_view_state', "ALTER TABLE user_preferences ADD COLUMN cards_view_state JSON DEFAULT NULL AFTER report_history_view_state", 'user_preferences.cards_view_state'],
+                    ['system_logs_view_state', "ALTER TABLE user_preferences ADD COLUMN system_logs_view_state JSON DEFAULT NULL AFTER cards_view_state", 'user_preferences.system_logs_view_state'],
+                ];
+                for (const [columnName, alterSql, label] of userPreferenceColumnEnsures) {
+                    const [columnRows] = await pool.execute(
+                        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'user_preferences' AND COLUMN_NAME = ?`,
+                        [DB_NAME, columnName],
+                    );
+                    if (columnRows.length === 0) {
+                        logger.info(`检测到缺少 ${label}，正在添加...`);
+                        await pool.query(alterSql);
+                        logger.info(`✅ ${label} 添加完成`);
+                    }
+                }
+            }
+
+            const [accountBagPreferencesTable] = await pool.execute(`SHOW TABLES LIKE 'account_bag_preferences'`);
+            if (accountBagPreferencesTable.length === 0) {
+                await runMigrationFile(
+                    path.join(migrationsDir, '016-account-bag-preferences.sql'),
+                    '检测到缺少 account_bag_preferences 表，正在执行迁移 016-account-bag-preferences.sql',
+                );
+            }
+
+            const [uiSettingsTable] = await pool.execute(`SHOW TABLES LIKE 'ui_settings'`);
+            if (uiSettingsTable.length > 0) {
+                const uiSettingColumnEnsures = [
+                    ['login_background', "ALTER TABLE ui_settings ADD COLUMN login_background VARCHAR(2048) COLLATE utf8mb4_unicode_ci DEFAULT '' AFTER performance_mode", 'ui_settings.login_background'],
+                    ['background_scope', "ALTER TABLE ui_settings ADD COLUMN background_scope VARCHAR(32) COLLATE utf8mb4_unicode_ci DEFAULT 'login_only' AFTER login_background", 'ui_settings.background_scope'],
+                    ['login_background_overlay_opacity', "ALTER TABLE ui_settings ADD COLUMN login_background_overlay_opacity INT DEFAULT 30 AFTER background_scope", 'ui_settings.login_background_overlay_opacity'],
+                    ['login_background_blur', "ALTER TABLE ui_settings ADD COLUMN login_background_blur INT DEFAULT 2 AFTER login_background_overlay_opacity", 'ui_settings.login_background_blur'],
+                    ['workspace_visual_preset', "ALTER TABLE ui_settings ADD COLUMN workspace_visual_preset VARCHAR(32) COLLATE utf8mb4_unicode_ci DEFAULT 'console' AFTER login_background_blur", 'ui_settings.workspace_visual_preset'],
+                    ['app_background_overlay_opacity', "ALTER TABLE ui_settings ADD COLUMN app_background_overlay_opacity INT DEFAULT 54 AFTER workspace_visual_preset", 'ui_settings.app_background_overlay_opacity'],
+                    ['app_background_blur', "ALTER TABLE ui_settings ADD COLUMN app_background_blur INT DEFAULT 8 AFTER app_background_overlay_opacity", 'ui_settings.app_background_blur'],
+                    ['color_theme', "ALTER TABLE ui_settings ADD COLUMN color_theme VARCHAR(64) COLLATE utf8mb4_unicode_ci DEFAULT 'default' AFTER app_background_blur", 'ui_settings.color_theme'],
+                    ['theme_background_linked', "ALTER TABLE ui_settings ADD COLUMN theme_background_linked TINYINT(1) DEFAULT 0 AFTER color_theme", 'ui_settings.theme_background_linked'],
+                    ['ui_timestamp', "ALTER TABLE ui_settings ADD COLUMN ui_timestamp BIGINT DEFAULT 0 AFTER theme_background_linked", 'ui_settings.ui_timestamp'],
+                ];
+                for (const [columnName, alterSql, label] of uiSettingColumnEnsures) {
+                    const [columnRows] = await pool.execute(
+                        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'ui_settings' AND COLUMN_NAME = ?`,
+                        [DB_NAME, columnName],
+                    );
+                    if (columnRows.length === 0) {
+                        logger.info(`检测到缺少 ${label}，正在添加...`);
+                        await pool.query(alterSql);
+                        logger.info(`✅ ${label} 添加完成`);
+                    }
+                }
+
+                const [uiUniqueIndexRows] = await pool.execute(
+                    `SELECT INDEX_NAME
+                     FROM INFORMATION_SCHEMA.STATISTICS
+                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'ui_settings' AND INDEX_NAME = 'uk_ui_settings_user_id'`,
+                    [DB_NAME],
+                );
+                if (uiUniqueIndexRows.length === 0) {
+                    logger.info('检测到 ui_settings 缺少 user_id 唯一索引，正在清理重复数据并补齐...');
+                    await pool.query(`
+                        DELETE older
+                        FROM ui_settings older
+                        INNER JOIN ui_settings newer
+                            ON older.user_id = newer.user_id
+                            AND older.id < newer.id
+                    `);
+                    await pool.query('ALTER TABLE ui_settings ADD UNIQUE KEY uk_ui_settings_user_id (user_id)');
+                    logger.info('✅ ui_settings.uk_ui_settings_user_id 添加完成');
+                }
+            }
         }
 
         const connection = await pool.getConnection();
@@ -321,7 +430,7 @@ async function initMysql() {
  */
 async function query(sql, params = [], retries = 1) {
     try {
-        const [rows, fields] = await pool.execute(sql, params);
+        const [rows] = await pool.execute(sql, params);
         return rows;
     } catch (e) {
         if (retries > 0 && (e.code === 'ECONNRESET' || e.code === 'PROTOCOL_CONNECTION_LOST' || e.code === 'ETIMEDOUT')) {
@@ -357,14 +466,14 @@ async function transaction(fn, retries = 1) {
         try { await connection.rollback(); } catch { /* transaction may not have started */ }
         if (retries > 0 && (e.code === 'ECONNRESET' || e.code === 'PROTOCOL_CONNECTION_LOST' || e.code === 'ETIMEDOUT')) {
             logger.warn(`[mysql-db] 事务执行期遭逢断链 ${e.code}，回滚并移交重试管道 (剩余: ${retries})`);
-            try { connection.release(); } catch (ignore) { }
+            try { connection.release(); } catch { }
             return transaction(fn, retries - 1);
         }
         logger.error('事务已回滚:', e.message);
         throw e;
     } finally {
         if (connection && connection.release) {
-            try { connection.release(); } catch (ignore) { }
+            try { connection.release(); } catch { }
         }
     }
 }
@@ -380,8 +489,23 @@ function isMysqlInitialized() {
     return _initialized;
 }
 
+async function closeMysql() {
+    if (poolMonitorHandle) {
+        clearInterval(poolMonitorHandle);
+    }
+
+    if (!_initialized) {
+        return;
+    }
+
+    await pool.end();
+    _initialized = false;
+    logger.info('MySQL closed');
+}
+
 module.exports = {
     initMysql,
+    closeMysql,
     query,
     transaction,
     getPool,

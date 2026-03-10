@@ -3,6 +3,11 @@ import { onMounted, ref, watch } from 'vue'
 import api from '@/api'
 import { useStatusStore } from '@/stores/status'
 import { adminToken } from '@/utils/auth'
+import {
+  hydrateServerBackedStringPreference,
+  normalizeAnnouncementDismissedId,
+  persistServerBackedStringPreference,
+} from '@/utils/view-preferences'
 
 interface Announcement {
   id: number
@@ -21,25 +26,25 @@ const announcements = ref<Announcement[]>([])
 const show = ref(false)
 const loading = ref(false)
 const expandedIdx = ref<number>(0) // 默认展开第一项
+const dismissedId = ref('')
+const ANNOUNCEMENT_DISMISSED_STORAGE_KEY = 'announcement_dismissed_id'
+const ANNOUNCEMENT_SYNC_NOTE = '公告关闭状态会跟随当前登录账号同步到服务器；离线时仍会先用本机缓存兜底。'
 
-const DISMISSED_KEY = 'announcement_dismissed_id'
-
-function getDismissedId(): string {
-  try {
-    return String(localStorage.getItem(DISMISSED_KEY) || '')
-  }
-  catch {
-    return ''
-  }
+async function hydrateDismissedId() {
+  dismissedId.value = await hydrateServerBackedStringPreference({
+    payloadKey: 'announcementDismissedId',
+    localKey: ANNOUNCEMENT_DISMISSED_STORAGE_KEY,
+    normalize: normalizeAnnouncementDismissedId,
+  })
 }
 
-function setDismissedId(id: number) {
-  try {
-    localStorage.setItem(DISMISSED_KEY, String(id))
-  }
-  catch {
-    /* ignore */
-  }
+async function setDismissedId(id: number) {
+  dismissedId.value = await persistServerBackedStringPreference({
+    payloadKey: 'announcementDismissedId',
+    localKey: ANNOUNCEMENT_DISMISSED_STORAGE_KEY,
+    value: String(id),
+    normalize: normalizeAnnouncementDismissedId,
+  })
 }
 
 async function fetchAnnouncement() {
@@ -67,19 +72,18 @@ function shouldShow(list: Announcement[]): boolean {
   const latest = list[0]
   if (!latest)
     return false
-  const dismissed = getDismissedId()
-  return dismissed !== String(latest.id)
+  return dismissedId.value !== String(latest.id)
 }
 
 function updateVisibility() {
   show.value = shouldShow(announcements.value)
 }
 
-function onClose() {
+async function onClose() {
   if (announcements.value.length > 0) {
     const latest = announcements.value[0]
     if (latest && latest.id != null) {
-      setDismissedId(latest.id)
+      await setDismissedId(latest.id)
     }
   }
   show.value = false
@@ -89,11 +93,17 @@ function toggle(idx: number) {
   expandedIdx.value = expandedIdx.value === idx ? -1 : idx
 }
 
+function getAnnouncementCardClass(idx: number) {
+  return expandedIdx.value === idx
+    ? 'announcement-dialog-card announcement-dialog-card--active'
+    : 'announcement-dialog-card'
+}
+
 onMounted(async () => {
   if (!adminToken.value)
     return
 
-  await fetchAnnouncement()
+  await Promise.all([fetchAnnouncement(), hydrateDismissedId()])
   updateVisibility()
 
   if (show.value) {
@@ -114,10 +124,11 @@ watch(
 watch(adminToken, async (token) => {
   if (!token) {
     announcements.value = []
+    dismissedId.value = ''
     show.value = false
     return
   }
-  await fetchAnnouncement()
+  await Promise.all([fetchAnnouncement(), hydrateDismissedId()])
   updateVisibility()
   if (show.value) {
     statusStore.connectRealtime('all')
@@ -132,17 +143,17 @@ watch(adminToken, async (token) => {
       class="fixed inset-0 z-[60] flex items-center justify-center p-4"
     >
       <div
-        class="absolute inset-0 bg-gray-900/40 backdrop-blur-md transition-opacity dark:bg-black/60"
+        class="announcement-dialog-backdrop absolute inset-0 backdrop-blur-md transition-opacity"
         @click="onClose"
       />
 
       <div
-        class="glass-panel relative max-h-[85vh] max-w-lg w-full flex flex-col transform overflow-hidden border border-white/20 rounded-2xl shadow-2xl transition-all dark:border-white/10"
+        class="announcement-dialog-panel glass-panel relative max-h-[85vh] max-w-lg w-full flex flex-col transform overflow-hidden rounded-2xl shadow-2xl transition-all"
         @click.stop
       >
-        <div class="flex shrink-0 items-center justify-between border-b border-gray-200/50 px-6 py-5 dark:border-white/10">
+        <div class="announcement-dialog-header flex shrink-0 items-center justify-between px-6 py-5">
           <div class="flex items-center gap-2.5">
-            <div class="h-8 w-8 flex items-center justify-center rounded-full bg-amber-50/50 dark:bg-amber-900/30">
+            <div class="announcement-dialog-icon h-8 w-8 flex items-center justify-center rounded-full">
               <div class="i-carbon-information text-lg text-amber-500" />
             </div>
             <h3 class="glass-text-main text-xl font-bold tracking-wide">
@@ -150,7 +161,7 @@ watch(adminToken, async (token) => {
             </h3>
           </div>
           <button
-            class="rounded-full p-2 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-700 dark:hover:text-gray-300"
+            class="announcement-dialog-close rounded-full p-2 transition-colors"
             @click="onClose"
           >
             <div class="i-carbon-close text-xl" />
@@ -162,22 +173,22 @@ watch(adminToken, async (token) => {
         </div>
         <div
           v-else
-          class="custom-scrollbar flex-1 overflow-y-auto bg-gray-50/30 p-4 space-y-2 dark:bg-gray-900/30"
+          class="announcement-dialog-list custom-scrollbar flex-1 overflow-y-auto p-4 space-y-2"
         >
           <div
             v-for="(entry, idx) in announcements"
             :key="entry.id"
-            class="overflow-hidden border border-gray-200 rounded-lg bg-white transition-all dark:border-gray-700 dark:bg-gray-800"
-            :class="{ 'ring-1 ring-primary-500/30 shadow-md': expandedIdx === idx }"
+            class="overflow-hidden rounded-lg transition-all"
+            :class="getAnnouncementCardClass(idx)"
           >
             <!-- 条目头部（可点击展开） -->
             <button
-              class="dark:hover:bg-gray-750 w-full flex items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-gray-50"
+              class="announcement-dialog-toggle w-full flex items-center gap-3 px-4 py-3 text-left transition-colors"
               @click="toggle(idx)"
             >
               <!-- 展开指示器 -->
               <div
-                class="i-carbon-chevron-right text-sm text-gray-400 transition-transform duration-200"
+                class="i-carbon-chevron-right glass-text-muted text-sm transition-transform duration-200"
                 :class="expandedIdx === idx ? 'rotate-90' : ''"
               />
               <div class="flex flex-1 flex-col overflow-hidden">
@@ -185,20 +196,20 @@ watch(adminToken, async (token) => {
                   <!-- 最新标记 -->
                   <span
                     v-if="idx === 0"
-                    class="shrink-0 rounded bg-red-100 px-1.5 py-0.5 text-[10px] text-red-600 font-bold dark:bg-red-900/40 dark:text-red-400"
+                    class="announcement-dialog-hot shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold"
                   >
                     HOT
                   </span>
                   <!-- 标题 -->
-                  <span class="truncate text-sm text-gray-800 font-bold dark:text-gray-200">
+                  <span class="announcement-dialog-title truncate text-sm font-bold">
                     {{ entry.title }}
                   </span>
                 </div>
-                <div class="mt-1 flex items-center gap-2 text-[11px] text-gray-500">
+                <div class="glass-text-muted mt-1 flex items-center gap-2 text-[11px]">
                   <!-- 版本徽章 -->
                   <span
                     v-if="entry.version"
-                    class="rounded-full bg-blue-50 px-1.5 py-0.5 text-blue-600 font-medium dark:bg-blue-900/20 dark:text-blue-400"
+                    class="announcement-dialog-version rounded-full px-1.5 py-0.5 font-medium"
                   >
                     {{ entry.version }}
                   </span>
@@ -209,15 +220,18 @@ watch(adminToken, async (token) => {
             </button>
 
             <!-- 展开内容 -->
-            <div v-show="expandedIdx === idx" class="border-t border-gray-100 bg-gray-50/50 px-5 py-4 dark:border-gray-700 dark:bg-gray-800/80">
-              <pre class="whitespace-pre-wrap text-sm text-gray-700 leading-relaxed font-sans dark:text-gray-300" style="font-family: inherit;">{{ entry.content }}</pre>
+            <div v-show="expandedIdx === idx" class="announcement-dialog-content px-5 py-4">
+              <pre class="glass-text-main whitespace-pre-wrap text-sm leading-relaxed font-sans" style="font-family: inherit;">{{ entry.content }}</pre>
             </div>
           </div>
         </div>
 
-        <div class="glass-panel shrink-0 border-t border-gray-100 px-6 py-4 dark:border-gray-700">
+        <div class="announcement-dialog-footer glass-panel shrink-0 px-6 py-4">
+          <p class="announcement-dialog-note mb-3 text-xs leading-5">
+            {{ ANNOUNCEMENT_SYNC_NOTE }}
+          </p>
           <button
-            class="relative w-full flex items-center justify-center gap-2 rounded-xl from-amber-500 to-orange-500 bg-gradient-to-r px-4 py-3 text-base text-white font-bold shadow-amber-500/30 shadow-lg transition-all active:scale-[0.98] hover:from-amber-600 hover:to-orange-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-amber-500"
+            class="announcement-dialog-confirm relative w-full flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-base font-bold transition-all active:scale-[0.98] focus:outline-none"
             @click="onClose"
           >
             <div class="i-carbon-checkmark text-xl" />
@@ -230,16 +244,126 @@ watch(adminToken, async (token) => {
 </template>
 
 <style scoped>
+.announcement-dialog-backdrop {
+  background: var(--ui-overlay-backdrop) !important;
+}
+
+.announcement-dialog-panel,
+.announcement-dialog-header,
+.announcement-dialog-icon,
+.announcement-dialog-close,
+.announcement-dialog-list,
+.announcement-dialog-card,
+.announcement-dialog-content,
+.announcement-dialog-footer,
+.announcement-dialog-version,
+.announcement-dialog-hot {
+  border: 1px solid var(--ui-border-subtle) !important;
+}
+
+.announcement-dialog-panel,
+.announcement-dialog-header,
+.announcement-dialog-list,
+.announcement-dialog-card,
+.announcement-dialog-footer {
+  background: color-mix(in srgb, var(--ui-bg-surface) 72%, transparent) !important;
+}
+
+.announcement-dialog-header,
+.announcement-dialog-footer {
+  border-left: none !important;
+  border-right: none !important;
+}
+
+.announcement-dialog-header {
+  border-top: none !important;
+}
+
+.announcement-dialog-footer {
+  border-bottom: none !important;
+}
+
+.announcement-dialog-icon {
+  background: color-mix(in srgb, var(--ui-status-warning) 10%, transparent) !important;
+  color: color-mix(in srgb, var(--ui-status-warning) 80%, var(--ui-text-1)) !important;
+}
+
+.announcement-dialog-close {
+  color: var(--ui-text-2) !important;
+}
+
+.announcement-dialog-close:hover,
+.announcement-dialog-toggle:hover {
+  color: var(--ui-text-1) !important;
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 88%, transparent) !important;
+}
+
+.announcement-dialog-list {
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 78%, transparent) !important;
+}
+
+.announcement-dialog-card--active {
+  border-color: color-mix(in srgb, var(--ui-brand-500) 26%, var(--ui-border-subtle)) !important;
+  box-shadow: 0 14px 28px var(--ui-shadow-panel) !important;
+}
+
+.announcement-dialog-title {
+  color: var(--ui-text-1) !important;
+}
+
+.announcement-dialog-hot {
+  background: color-mix(in srgb, var(--ui-status-danger) 10%, transparent) !important;
+  color: color-mix(in srgb, var(--ui-status-danger) 78%, var(--ui-text-1)) !important;
+}
+
+.announcement-dialog-version {
+  background: color-mix(in srgb, var(--ui-status-info) 10%, transparent) !important;
+  color: color-mix(in srgb, var(--ui-status-info) 78%, var(--ui-text-1)) !important;
+}
+
+.announcement-dialog-note {
+  color: color-mix(in srgb, var(--ui-status-info) 70%, var(--ui-text-2)) !important;
+}
+
+.announcement-dialog-content {
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 82%, transparent) !important;
+  border-left: none !important;
+  border-right: none !important;
+  border-bottom: none !important;
+}
+
+.announcement-dialog-confirm {
+  background: linear-gradient(
+    to right,
+    color-mix(in srgb, var(--ui-brand-500) 84%, var(--ui-status-warning) 16%),
+    color-mix(in srgb, var(--ui-brand-600) 76%, var(--ui-status-warning) 24%)
+  ) !important;
+  color: var(--ui-text-on-brand) !important;
+  box-shadow: 0 16px 28px color-mix(in srgb, var(--ui-brand-500) 24%, transparent) !important;
+}
+
+.announcement-dialog-confirm:hover {
+  filter: brightness(0.98);
+}
+
+.announcement-dialog-confirm:focus-visible {
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--ui-brand-500) 18%, transparent),
+    0 16px 28px color-mix(in srgb, var(--ui-brand-500) 24%, transparent) !important;
+}
+
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px;
 }
 .custom-scrollbar::-webkit-scrollbar-track {
-  @apply rounded-full bg-gray-100 dark:bg-gray-800;
+  background: color-mix(in srgb, var(--ui-bg-surface) 64%, transparent);
+  border-radius: 999px;
 }
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  @apply rounded-full bg-gray-300 dark:bg-gray-600;
+  background: color-mix(in srgb, var(--ui-scrollbar-thumb) 78%, transparent);
+  border-radius: 999px;
 }
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  @apply bg-gray-400 dark:bg-gray-500;
+  background: color-mix(in srgb, var(--ui-scrollbar-thumb-hover) 82%, transparent);
 }
 </style>

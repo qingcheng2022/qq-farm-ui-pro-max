@@ -1,20 +1,32 @@
 <script setup lang="ts">
+import type { AnalyticsViewState } from '@/utils/view-preferences'
 import { useStorage } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
-import { onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import api from '@/api'
 import BaseSelect from '@/components/ui/BaseSelect.vue'
 import { useAccountStore } from '@/stores/account'
+import { useStatusStore } from '@/stores/status'
+import { DEFAULT_ANALYTICS_VIEW_STATE, fetchViewPreferences, normalizeAnalyticsViewState, saveViewPreferences } from '@/utils/view-preferences'
 
 const accountStore = useAccountStore()
-const { currentAccountId } = storeToRefs(accountStore)
+const statusStore = useStatusStore()
+const { currentAccountId, currentAccount } = storeToRefs(accountStore)
+const { status, realtimeConnected } = storeToRefs(statusStore)
 
 const loading = ref(false)
 const list = ref<any[]>([])
-const sortKey = useStorage('analytics_sort_key', 'exp')
+const sortKey = useStorage<AnalyticsViewState['sortKey']>('analytics_sort_key', DEFAULT_ANALYTICS_VIEW_STATE.sortKey)
 const imageErrors = ref<Record<string | number, boolean>>({})
 const strategyPanelCollapsed = useStorage('analytics_strategy_collapsed', false)
-const levelFilter = ref(0) // 0 = 不过滤
+const ANALYTICS_BROWSER_PREF_NOTE = '排序方式和“展开 / 收起推荐”会跟随当前登录用户同步到服务器；本机缓存只作首屏兜底。'
+let analyticsViewSyncTimer: ReturnType<typeof setTimeout> | null = null
+let analyticsViewHydrating = false
+let analyticsViewSyncEnabled = false
+const strategyLevel = ref(0)
+const strategyLevelMode = ref<'account' | 'manual'>('account')
+const liveAccountLevel = ref<number | null>(null)
+const analyticsViewSignature = computed(() => JSON.stringify(buildAnalyticsViewState()))
 
 // 策略推荐定义 (参考 PR 版 Analytics.vue)
 const strategies = [
@@ -24,31 +36,9 @@ const strategies = [
   { key: 'max_fert_profit', label: '普肥利润/时', metric: 'normalFertilizerProfitPerHour', color: 'green', icon: 'i-carbon-piggy-bank', unit: '金币', desc: '使用普通化肥后利润最高' },
 ]
 
-/** 根据等级过滤并获取策略最优作物 */
-function getStrategyBestPlant(strategyKey: string) {
-  const strategy = strategies.find(s => s.key === strategyKey)
-  if (!strategy || list.value.length === 0)
-    return null
-  const filtered = levelFilter.value > 0
-    ? list.value.filter((item: any) => {
-        const lv = Number(item.level)
-        return Number.isFinite(lv) && lv <= levelFilter.value
-      })
-    : list.value
-  if (filtered.length === 0)
-    return null
-  // 排序后取 Top 1
-  const sorted = [...filtered].sort((a, b) => {
-    const av = Number(a[strategy.metric])
-    const bv = Number(b[strategy.metric])
-    if (!Number.isFinite(av))
-      return 1
-    if (!Number.isFinite(bv))
-      return -1
-    return bv - av
-  })
-  const best = sorted[0]
-  return best && Number.isFinite(Number(best[strategy.metric])) ? best : null
+function normalizeLevel(value: any) {
+  const level = Number(value)
+  return Number.isFinite(level) && level > 0 ? Math.floor(level) : 0
 }
 
 const sortOptions = [
@@ -59,14 +49,90 @@ const sortOptions = [
   { value: 'level', label: '等级' },
 ]
 
-async function loadAnalytics() {
-  if (!currentAccountId.value)
+const currentAccountLevel = computed(() => normalizeLevel(currentAccount.value?.level))
+const effectiveAccountLevel = computed(() => liveAccountLevel.value ?? currentAccountLevel.value)
+
+const strategyCandidates = computed(() => {
+  if (strategyLevel.value <= 0)
+    return list.value
+  return list.value.filter((item: any) => {
+    if (item.level === null || item.level === undefined || item.level === '')
+      return true
+    const lv = Number(item.level)
+    return Number.isFinite(lv) && lv <= strategyLevel.value
+  })
+})
+
+const bestPlantsByStrategy = computed<Record<string, any | null>>(() => {
+  const result: Record<string, any | null> = {}
+  for (const strategy of strategies) {
+    let best: any | null = null
+    let bestMetric = Number.NEGATIVE_INFINITY
+    for (const item of strategyCandidates.value) {
+      const metricValue = Number(item?.[strategy.metric])
+      if (!Number.isFinite(metricValue) || metricValue <= bestMetric)
+        continue
+      best = item
+      bestMetric = metricValue
+    }
+    result[strategy.key] = best
+  }
+  return result
+})
+
+const strategySummaryText = computed(() => {
+  if (strategyLevelMode.value === 'account') {
+    return effectiveAccountLevel.value > 0
+      ? `已按当前账号 Lv${effectiveAccountLevel.value} 推荐`
+      : '当前账号等级未知，已显示全量推荐'
+  }
+  return strategyLevel.value > 0
+    ? `当前查看 Lv${strategyLevel.value} 以内策略`
+    : '未限制等级，已显示全量推荐'
+})
+
+const strategyInputValue = computed(() => (strategyLevel.value > 0 ? String(strategyLevel.value) : ''))
+
+function syncStrategyLevelWithAccount(force = false) {
+  if (!force && strategyLevelMode.value !== 'account')
     return
+  strategyLevel.value = effectiveAccountLevel.value > 0 ? effectiveAccountLevel.value : 0
+}
+
+async function refreshAccountLevel() {
+  if (!currentAccountId.value) {
+    liveAccountLevel.value = null
+    syncStrategyLevelWithAccount(true)
+    return
+  }
+
+  liveAccountLevel.value = null
+  syncStrategyLevelWithAccount(true)
+
+  if (realtimeConnected.value)
+    return
+
+  try {
+    await statusStore.fetchStatus(currentAccountId.value)
+    liveAccountLevel.value = normalizeLevel(status.value?.status?.level) || null
+  }
+  catch (e) {
+    console.error('获取分析所需账号等级失败:', e)
+    liveAccountLevel.value = null
+  }
+  finally {
+    syncStrategyLevelWithAccount(true)
+  }
+}
+
+async function loadAnalytics() {
+  if (!currentAccountId.value) {
+    list.value = []
+    return
+  }
   loading.value = true
   try {
     const params: Record<string, string | number> = { sort: sortKey.value }
-    if (levelFilter.value > 0)
-      params.level = levelFilter.value
     const res = await api.get(`/api/analytics`, {
       params,
       headers: { 'x-account-id': currentAccountId.value },
@@ -110,13 +176,108 @@ async function loadAnalytics() {
   }
 }
 
-onMounted(() => {
+function buildAnalyticsViewState() {
+  return normalizeAnalyticsViewState({
+    sortKey: sortKey.value,
+    strategyPanelCollapsed: strategyPanelCollapsed.value,
+  }, DEFAULT_ANALYTICS_VIEW_STATE)
+}
+
+function applyAnalyticsViewState(state: Partial<typeof DEFAULT_ANALYTICS_VIEW_STATE> | null | undefined) {
+  const normalized = normalizeAnalyticsViewState(state, DEFAULT_ANALYTICS_VIEW_STATE)
+  analyticsViewHydrating = true
+  sortKey.value = normalized.sortKey
+  strategyPanelCollapsed.value = normalized.strategyPanelCollapsed
+  analyticsViewHydrating = false
+}
+
+function clearAnalyticsViewSyncTimer() {
+  if (analyticsViewSyncTimer) {
+    clearTimeout(analyticsViewSyncTimer)
+    analyticsViewSyncTimer = null
+  }
+}
+
+function scheduleAnalyticsViewSync() {
+  clearAnalyticsViewSyncTimer()
+  const payload = buildAnalyticsViewState()
+  analyticsViewSyncTimer = setTimeout(async () => {
+    try {
+      await saveViewPreferences({
+        analyticsViewState: payload,
+      })
+    }
+    catch (error) {
+      console.warn('保存图鉴页视图偏好失败', error)
+    }
+  }, 240)
+}
+
+async function hydrateAnalyticsViewState() {
+  const localFallback = buildAnalyticsViewState()
+  try {
+    const payload = await fetchViewPreferences()
+    if (payload?.analyticsViewState) {
+      applyAnalyticsViewState(payload.analyticsViewState)
+      return
+    }
+    applyAnalyticsViewState(localFallback)
+    if (JSON.stringify(localFallback) !== JSON.stringify(DEFAULT_ANALYTICS_VIEW_STATE)) {
+      await saveViewPreferences({
+        analyticsViewState: localFallback,
+      })
+    }
+  }
+  catch (error) {
+    console.warn('读取图鉴页视图偏好失败', error)
+    applyAnalyticsViewState(localFallback)
+  }
+}
+
+onMounted(async () => {
+  await hydrateAnalyticsViewState()
+  refreshAccountLevel()
+  loadAnalytics()
+  analyticsViewSyncEnabled = true
+})
+
+watch(() => currentAccountId.value, () => {
+  strategyLevelMode.value = 'account'
+  liveAccountLevel.value = null
+  refreshAccountLevel()
   loadAnalytics()
 })
 
-watch([currentAccountId, sortKey, levelFilter], () => {
+watch(() => currentAccountLevel.value, () => {
+  syncStrategyLevelWithAccount()
+})
+
+watch(() => sortKey.value, () => {
+  if (analyticsViewHydrating)
+    return
   loadAnalytics()
 })
+
+watch(analyticsViewSignature, () => {
+  if (!analyticsViewSyncEnabled || analyticsViewHydrating)
+    return
+  scheduleAnalyticsViewSync()
+})
+
+onBeforeUnmount(() => {
+  clearAnalyticsViewSyncTimer()
+})
+
+function useAccountLevelRecommendation() {
+  strategyLevelMode.value = 'account'
+  syncStrategyLevelWithAccount(true)
+}
+
+function updateStrategyLevel(event: Event) {
+  const target = event.target as HTMLInputElement
+  strategyLevelMode.value = 'manual'
+  strategyLevel.value = normalizeLevel(target.value)
+}
 
 function formatLv(level: any) {
   if (level === null || level === undefined || level === '' || Number(level) < 0)
@@ -142,7 +303,7 @@ function formatGrowTime(seconds: any) {
 </script>
 
 <template>
-  <div class="p-4">
+  <div class="analytics-page ui-page-shell w-full">
     <div class="mb-4 flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
       <h2 class="flex items-center gap-2 text-2xl font-bold">
         <div class="i-carbon-catalog" />
@@ -159,6 +320,10 @@ function formatGrowTime(seconds: any) {
       </div>
     </div>
 
+    <div class="mb-4 border border-sky-200/70 rounded-xl bg-sky-50/70 px-3 py-2 text-xs text-sky-700 leading-5 dark:border-sky-800/40 dark:bg-sky-900/15 dark:text-sky-200">
+      {{ ANALYTICS_BROWSER_PREF_NOTE }}
+    </div>
+
     <div v-if="loading" class="flex justify-center py-12">
       <div class="i-svg-spinners-90-ring-with-bg text-4xl text-blue-500" />
     </div>
@@ -168,31 +333,61 @@ function formatGrowTime(seconds: any) {
     </div>
 
     <!-- 策略推荐面板 (T3 - 参考 PR 版) -->
-    <div v-if="list.length > 0" class="glass-panel mb-4 overflow-hidden rounded-xl shadow-md">
-      <div
-        class="flex cursor-pointer items-center justify-between px-4 py-3"
-        @click="strategyPanelCollapsed = !strategyPanelCollapsed"
-      >
-        <div class="flex items-center gap-2">
+    <div v-if="!loading && currentAccountId && list.length > 0" class="glass-panel mb-4 overflow-hidden rounded-xl shadow-md">
+      <div class="flex flex-col gap-3 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
+        <div class="min-w-0 flex items-center gap-2">
           <div class="i-carbon-trophy text-lg text-yellow-500" />
-          <span class="glass-text-main font-bold">策略推荐</span>
-          <span class="glass-text-muted text-xs">根据 4 个维度推荐最优作物</span>
+          <div class="min-w-0">
+            <div class="glass-text-main font-bold">
+              策略推荐
+            </div>
+            <div class="glass-text-muted text-xs">
+              {{ strategySummaryText }}
+            </div>
+          </div>
         </div>
-        <div class="flex items-center gap-2">
-          <div v-if="!strategyPanelCollapsed" class="flex items-center gap-1">
-            <span class="glass-text-muted text-xs">等级≤</span>
+
+        <div class="flex flex-wrap items-center gap-2" @click.stop>
+          <span class="border border-primary-500/20 rounded-full bg-primary-500/10 px-2.5 py-1 text-xs text-primary-600 font-semibold dark:text-primary-400">
+            当前账号 {{ effectiveAccountLevel > 0 ? `Lv${effectiveAccountLevel}` : '等级未知' }}
+          </span>
+          <button
+            type="button"
+            class="border rounded-full px-3 py-1 text-xs font-medium transition"
+            :class="strategyLevelMode === 'account'
+              ? 'border-primary-500/25 bg-primary-500/12 text-primary-600 dark:text-primary-400'
+              : 'border-white/15 bg-white/5 text-gray-600 hover:border-primary-500/25 hover:text-primary-600 dark:text-gray-300 dark:hover:text-primary-400'"
+            @click="useAccountLevelRecommendation"
+          >
+            跟随当前等级
+          </button>
+          <div
+            v-if="!strategyPanelCollapsed"
+            class="flex items-center gap-2 border border-white/15 rounded-full bg-white/5 px-3 py-1.5 dark:bg-black/10"
+          >
+            <span class="glass-text-muted text-xs">查看等级≤</span>
             <input
-              v-model.number="levelFilter"
+              :value="strategyInputValue"
               type="number"
               min="0"
               placeholder="全部"
-              class="glass-panel w-14 border border-white/20 rounded px-2 py-1 text-center text-sm outline-none dark:border-white/10 focus:border-primary-400"
+              class="w-14 bg-transparent text-center text-sm outline-none"
+              @input="updateStrategyLevel"
+              @click.stop
             >
           </div>
-          <div
-            class="i-carbon-chevron-down glass-text-muted text-lg transition-transform"
-            :class="{ 'rotate-180': !strategyPanelCollapsed }"
-          />
+          <button
+            type="button"
+            class="glass-panel flex items-center gap-1 border border-white/15 rounded-full px-3 py-1.5 text-sm transition hover:border-primary-500/25"
+            :aria-expanded="!strategyPanelCollapsed"
+            @click="strategyPanelCollapsed = !strategyPanelCollapsed"
+          >
+            <span class="glass-text-muted text-xs">{{ strategyPanelCollapsed ? '展开推荐' : '收起推荐' }}</span>
+            <div
+              class="i-carbon-chevron-down glass-text-muted text-lg transition-transform"
+              :class="{ 'rotate-180': !strategyPanelCollapsed }"
+            />
+          </button>
         </div>
       </div>
 
@@ -210,24 +405,24 @@ function formatGrowTime(seconds: any) {
             </div>
 
             <!-- 推荐作物 -->
-            <div v-if="getStrategyBestPlant(strategy.key)" class="space-y-2">
+            <div v-if="bestPlantsByStrategy[strategy.key]" class="space-y-2">
               <div class="flex items-center gap-2">
                 <div class="h-8 w-8 flex shrink-0 items-center justify-center overflow-hidden rounded-md bg-primary-500/10">
                   <img
-                    v-if="getStrategyBestPlant(strategy.key)?.image && !imageErrors[getStrategyBestPlant(strategy.key)?.seedId]"
-                    :src="getStrategyBestPlant(strategy.key)?.image"
+                    v-if="bestPlantsByStrategy[strategy.key]?.image && !imageErrors[bestPlantsByStrategy[strategy.key]?.seedId]"
+                    :src="bestPlantsByStrategy[strategy.key]?.image"
                     class="h-6 w-6 object-contain"
                     loading="lazy"
-                    @error="imageErrors[getStrategyBestPlant(strategy.key)?.seedId] = true"
+                    @error="imageErrors[bestPlantsByStrategy[strategy.key]?.seedId] = true"
                   >
                   <div v-else class="i-carbon-sprout text-lg text-primary-500/50" />
                 </div>
                 <div class="min-w-0 flex-1">
                   <div class="glass-text-main truncate text-sm font-bold">
-                    {{ getStrategyBestPlant(strategy.key)?.name }}
+                    {{ bestPlantsByStrategy[strategy.key]?.name }}
                   </div>
                   <div class="glass-text-muted text-[10px]">
-                    Lv{{ formatLv(getStrategyBestPlant(strategy.key)?.level) }}
+                    Lv{{ formatLv(bestPlantsByStrategy[strategy.key]?.level) }}
                   </div>
                 </div>
               </div>
@@ -236,7 +431,7 @@ function formatGrowTime(seconds: any) {
                 <div class="flex items-baseline justify-between">
                   <span class="glass-text-muted text-xs">{{ strategy.unit }}/时</span>
                   <span class="text-base font-bold" :style="{ color: `var(--color-${strategy.color}-500, currentColor)` }">
-                    {{ getStrategyBestPlant(strategy.key)?.[strategy.metric] }}
+                    {{ bestPlantsByStrategy[strategy.key]?.[strategy.metric] }}
                   </span>
                 </div>
               </div>
@@ -249,11 +444,11 @@ function formatGrowTime(seconds: any) {
       </div>
     </div>
 
-    <div v-else-if="list.length === 0" class="glass-panel glass-text-muted rounded-xl p-8 text-center shadow-md">
+    <div v-if="!loading && currentAccountId && list.length === 0" class="glass-panel glass-text-muted rounded-xl p-8 text-center shadow-md">
       暂无数据
     </div>
 
-    <div v-else>
+    <div v-if="!loading && currentAccountId && list.length > 0">
       <div class="grid grid-cols-1 gap-4 lg:grid-cols-3 sm:grid-cols-2 xl:grid-cols-4">
         <div
           v-for="(item, idx) in list"

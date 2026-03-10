@@ -1,11 +1,17 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import NotificationPanel from '@/components/NotificationPanel.vue'
+import { useAppStore } from '@/stores/app'
 
 defineProps<{
   show: boolean
 }>()
 
 const emit = defineEmits(['close'])
+const appStore = useAppStore()
+const supportQqGroup = computed(() => appStore.supportQqGroup)
+const copyrightText = computed(() => appStore.copyrightText)
+const UPDATE_MODAL_SYNC_NOTE = '当前版本的已读状态会跟随当前登录账号同步到服务器；离线时仍会先用本机缓存兜底。'
 </script>
 
 <template>
@@ -16,16 +22,16 @@ const emit = defineEmits(['close'])
     >
       <!-- 玻璃态遮罩 -->
       <div
-        class="absolute inset-0 bg-gray-900/40 backdrop-blur-md transition-opacity dark:bg-black/60"
+        class="notification-modal-backdrop absolute inset-0 backdrop-blur-md transition-opacity"
         @click="emit('close')"
       />
 
       <div
-        class="glass-panel relative max-h-[85vh] max-w-md w-full flex flex-col transform overflow-hidden border border-white/20 rounded-2xl shadow-2xl transition-all dark:border-white/10"
+        class="notification-modal-panel glass-panel relative max-h-[85vh] max-w-md w-full flex flex-col transform overflow-hidden rounded-2xl shadow-2xl transition-all"
         @click.stop
       >
         <!-- 头部 -->
-        <div class="flex shrink-0 items-center justify-between border-b border-gray-200/50 px-6 py-5 dark:border-white/10">
+        <div class="notification-modal-header flex shrink-0 items-center justify-between px-6 py-5">
           <div class="flex items-center gap-2.5">
             <div class="h-8 w-8 flex items-center justify-center rounded-full bg-blue-50/50 dark:bg-blue-900/30">
               <div class="i-carbon-notification-new text-lg text-blue-500" />
@@ -35,7 +41,7 @@ const emit = defineEmits(['close'])
             </h3>
           </div>
           <button
-            class="rounded-full p-2 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-700 dark:hover:text-gray-300"
+            class="notification-modal-close rounded-full p-2 transition-colors"
             @click="emit('close')"
           >
             <div class="i-carbon-close text-xl" />
@@ -48,20 +54,23 @@ const emit = defineEmits(['close'])
         </div>
 
         <!-- 底部动作条 -->
-        <div class="glass-panel shrink-0 border-t border-gray-100 px-6 py-4 dark:border-gray-700">
+        <div class="notification-modal-footer glass-panel shrink-0 px-6 py-4">
+          <p class="mb-3 text-xs text-sky-600 leading-5 dark:text-sky-300">
+            {{ UPDATE_MODAL_SYNC_NOTE }}
+          </p>
           <!-- 作者信息流水 -->
           <div class="glass-text-muted pointer-events-none mb-4 flex select-none items-center justify-between px-1 text-[10px] font-mono">
             <div class="flex items-center gap-1.5">
               <div class="i-carbon-user-avatar" />
-              <span>Author: smdk000</span>
+              <span>{{ copyrightText }}</span>
             </div>
             <div class="flex items-center gap-1.5">
               <div class="i-carbon-user-multiple" />
-              <span>QQ群: 227916149</span>
+              <span>QQ群: {{ supportQqGroup }}</span>
             </div>
           </div>
           <button
-            class="relative w-full flex items-center justify-center gap-2 rounded-xl from-blue-500 to-indigo-500 bg-gradient-to-r px-4 py-3 text-base text-white font-bold shadow-blue-500/30 shadow-lg transition-all active:scale-[0.98] hover:from-blue-600 hover:to-indigo-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+            class="notification-modal-confirm relative w-full flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-base font-bold transition-all active:scale-[0.98] focus:outline-none"
             @click="emit('close')"
           >
             <div class="i-carbon-checkmark text-xl" />
@@ -74,6 +83,49 @@ const emit = defineEmits(['close'])
 </template>
 
 <style scoped>
+.notification-modal-backdrop {
+  background: var(--ui-overlay-backdrop) !important;
+}
+
+.notification-modal-panel,
+.notification-modal-header,
+.notification-modal-footer {
+  border: 1px solid var(--ui-border-subtle) !important;
+}
+
+.notification-modal-header,
+.notification-modal-footer {
+  border-left: none !important;
+  border-right: none !important;
+}
+
+.notification-modal-header {
+  border-top: none !important;
+}
+
+.notification-modal-footer {
+  border-bottom: none !important;
+}
+
+.notification-modal-close {
+  color: var(--ui-text-2) !important;
+}
+
+.notification-modal-close:hover {
+  color: var(--ui-text-1) !important;
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 86%, transparent) !important;
+}
+
+.notification-modal-confirm {
+  background: linear-gradient(to right, var(--ui-brand-500), var(--ui-brand-600)) !important;
+  color: var(--ui-text-on-brand) !important;
+  box-shadow: 0 16px 28px color-mix(in srgb, var(--ui-brand-500) 24%, transparent) !important;
+}
+
+.notification-modal-confirm:hover {
+  filter: brightness(0.98);
+}
+
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px;
 }
@@ -81,10 +133,10 @@ const emit = defineEmits(['close'])
   background: transparent;
 }
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  background-color: rgba(156, 163, 175, 0.3);
+  background-color: color-mix(in srgb, var(--ui-scrollbar-thumb) 70%, transparent);
   border-radius: 4px;
 }
 .custom-scrollbar:hover::-webkit-scrollbar-thumb {
-  background-color: rgba(156, 163, 175, 0.5);
+  background-color: color-mix(in srgb, var(--ui-scrollbar-thumb-hover) 82%, transparent);
 }
 </style>

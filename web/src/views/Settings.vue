@@ -4,7 +4,7 @@
 import type { LoginBackgroundPreset } from '@/constants/ui-appearance'
 import type { ReportLogEntry } from '@/stores/setting'
 import { storeToRefs } from 'pinia'
-import { computed, onMounted, ref, watch, watchEffect } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch, watchEffect } from 'vue'
 import api from '@/api' // Apply config from server if possible
 import ConfirmModal from '@/components/ConfirmModal.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
@@ -18,24 +18,64 @@ import { useAppStore } from '@/stores/app'
 import { useFarmStore } from '@/stores/farm'
 import { useFriendStore } from '@/stores/friend'
 import { useSettingStore } from '@/stores/setting'
+import { createDefaultTradeConfig, normalizeTradeConfig, normalizeTradeKeepFruitIds } from '@/utils/trade-config'
+import { DEFAULT_REPORT_HISTORY_VIEW_STATE, fetchViewPreferences, normalizeReportHistoryViewState, saveViewPreferences } from '@/utils/view-preferences'
 
 const REPORT_HISTORY_VIEW_STORAGE_KEY = 'qq-farm-bot:report-history-view:v1'
+const REPORT_HISTORY_BROWSER_PREF_NOTE = '这里的筛选类型、筛选结果、每页条数、关键字和排序方式会跟随当前登录用户同步到服务器；本机缓存只作首屏兜底。汇报记录本身仍来自数据库。'
 
-function loadReportHistoryViewPreferences() {
+interface WebAssetsHealthSnapshot {
+  activeDir: string
+  activeSource: string
+  selectionReason: string
+  selectionReasonLabel: string
+  buildTargetDir: string
+  buildTargetSource: string
+  defaultDir: string
+  defaultHasAssets: boolean
+  defaultWritable: boolean
+  fallbackDir: string
+  fallbackHasAssets: boolean
+  fallbackWritable: boolean
+}
+
+interface SystemSettingsHealthSnapshot {
+  ok: boolean
+  checkedAt: number
+  missingRequiredKeys: string[]
+  fallbackWouldActivateKeys: string[]
+  webAssets?: WebAssetsHealthSnapshot | null
+}
+
+function loadReportHistoryViewPreferences(): typeof DEFAULT_REPORT_HISTORY_VIEW_STATE {
+  const fallback = DEFAULT_REPORT_HISTORY_VIEW_STATE
+  const modeOptions = ['all', 'test', 'hourly', 'daily'] as const
+  const statusOptions = ['all', 'success', 'failed'] as const
+  const sortOrderOptions = ['asc', 'desc'] as const
+  const pageSizeOptions = [10, 20, 50, 100] as const
   try {
     const raw = localStorage.getItem(REPORT_HISTORY_VIEW_STORAGE_KEY)
     if (!raw)
-      return { mode: 'all', status: 'all', keyword: '', sortOrder: 'desc' as 'desc' | 'asc', pageSize: 10 }
+      return { ...fallback }
     const parsed = JSON.parse(raw)
-    const mode = ['all', 'test', 'hourly', 'daily'].includes(parsed?.mode) ? parsed.mode : 'all'
-    const status = ['all', 'success', 'failed'].includes(parsed?.status) ? parsed.status : 'all'
-    const sortOrder = ['asc', 'desc'].includes(parsed?.sortOrder) ? parsed.sortOrder : 'desc'
-    const pageSize = [10, 20, 50, 100].includes(Number(parsed?.pageSize)) ? Number(parsed.pageSize) : 10
+    const mode = modeOptions.includes(parsed?.mode)
+      ? parsed.mode as typeof modeOptions[number]
+      : fallback.mode
+    const status = statusOptions.includes(parsed?.status)
+      ? parsed.status as typeof statusOptions[number]
+      : fallback.status
+    const sortOrder = sortOrderOptions.includes(parsed?.sortOrder)
+      ? parsed.sortOrder as typeof sortOrderOptions[number]
+      : fallback.sortOrder
+    const pageSizeValue = Number(parsed?.pageSize)
+    const pageSize = pageSizeOptions.includes(pageSizeValue as typeof pageSizeOptions[number])
+      ? pageSizeValue as typeof pageSizeOptions[number]
+      : fallback.pageSize
     const keyword = String(parsed?.keyword || '').slice(0, 100)
     return { mode, status, keyword, sortOrder, pageSize }
   }
   catch {
-    return { mode: 'all', status: 'all', keyword: '', sortOrder: 'desc' as 'desc' | 'asc', pageSize: 10 }
+    return { ...fallback }
   }
 }
 
@@ -74,54 +114,134 @@ const reportFilters = ref({
 })
 const reportKeyword = ref(reportHistoryViewPrefs.keyword)
 const reportSortOrder = ref<'desc' | 'asc'>(reportHistoryViewPrefs.sortOrder)
-const reportPageSize = ref(reportHistoryViewPrefs.pageSize)
+const reportPageSize = ref<typeof DEFAULT_REPORT_HISTORY_VIEW_STATE.pageSize>(
+  reportHistoryViewPrefs.pageSize as typeof DEFAULT_REPORT_HISTORY_VIEW_STATE.pageSize,
+)
+let reportHistoryViewSyncTimer: ReturnType<typeof setTimeout> | null = null
+let reportHistoryViewHydrating = false
+let reportHistoryViewSyncEnabled = false
+const reportHistoryViewSignature = computed(() => JSON.stringify(buildReportHistoryViewState()))
+
+function buildReportHistoryViewState() {
+  return normalizeReportHistoryViewState({
+    mode: reportFilters.value.mode,
+    status: reportFilters.value.status,
+    keyword: reportKeyword.value,
+    sortOrder: reportSortOrder.value,
+    pageSize: reportPageSize.value as typeof DEFAULT_REPORT_HISTORY_VIEW_STATE.pageSize,
+  }, DEFAULT_REPORT_HISTORY_VIEW_STATE)
+}
+
+function normalizeReportHistoryPageSize(value: number | undefined): typeof DEFAULT_REPORT_HISTORY_VIEW_STATE.pageSize {
+  return normalizeReportHistoryViewState(
+    { pageSize: value as typeof DEFAULT_REPORT_HISTORY_VIEW_STATE.pageSize | undefined },
+    buildReportHistoryViewState(),
+  ).pageSize
+}
+
+function applyReportHistoryViewState(state: Partial<typeof DEFAULT_REPORT_HISTORY_VIEW_STATE> | null | undefined) {
+  const normalized = normalizeReportHistoryViewState(state, DEFAULT_REPORT_HISTORY_VIEW_STATE)
+  reportHistoryViewHydrating = true
+  reportFilters.value = {
+    mode: normalized.mode,
+    status: normalized.status,
+  }
+  reportKeyword.value = normalized.keyword
+  reportSortOrder.value = normalized.sortOrder
+  reportPageSize.value = normalized.pageSize
+  reportHistoryViewHydrating = false
+}
+
+function clearReportHistoryViewSyncTimer() {
+  if (reportHistoryViewSyncTimer) {
+    clearTimeout(reportHistoryViewSyncTimer)
+    reportHistoryViewSyncTimer = null
+  }
+}
+
+function scheduleReportHistoryViewSync() {
+  clearReportHistoryViewSyncTimer()
+  const payload = buildReportHistoryViewState()
+  reportHistoryViewSyncTimer = setTimeout(async () => {
+    try {
+      await saveViewPreferences({
+        reportHistoryViewState: payload,
+      })
+    }
+    catch (error) {
+      console.warn('保存经营汇报历史视图偏好失败', error)
+    }
+  }, 240)
+}
+
+async function hydrateReportHistoryViewState() {
+  const localFallback = buildReportHistoryViewState()
+  try {
+    const payload = await fetchViewPreferences()
+    if (payload?.reportHistoryViewState) {
+      applyReportHistoryViewState(payload.reportHistoryViewState)
+      return
+    }
+    applyReportHistoryViewState(localFallback)
+    if (JSON.stringify(localFallback) !== JSON.stringify(DEFAULT_REPORT_HISTORY_VIEW_STATE)) {
+      await saveViewPreferences({
+        reportHistoryViewState: localFallback,
+      })
+    }
+  }
+  catch (error) {
+    console.warn('读取经营汇报历史视图偏好失败', error)
+    applyReportHistoryViewState(localFallback)
+  }
+}
+
 const reportHistoryStatsCards = computed(() => [
   {
     key: 'total',
     label: '当前结果总数',
     value: reportLogStats.value.total,
-    tone: 'text-gray-900 dark:text-gray-100',
-    bg: 'bg-slate-100/80 dark:bg-slate-800/40',
+    tone: 'settings-report-card-tone-main',
+    bg: 'settings-report-card-bg-neutral',
     active: reportFilters.value.mode === 'all' && reportFilters.value.status === 'all',
   },
   {
     key: 'success',
     label: '成功',
     value: reportLogStats.value.successCount,
-    tone: 'text-emerald-700 dark:text-emerald-300',
-    bg: 'bg-emerald-100/80 dark:bg-emerald-900/30',
+    tone: 'settings-report-card-tone-success',
+    bg: 'settings-report-card-bg-success',
     active: reportFilters.value.status === 'success',
   },
   {
     key: 'failed',
     label: '失败',
     value: reportLogStats.value.failedCount,
-    tone: 'text-red-700 dark:text-red-300',
-    bg: 'bg-red-100/80 dark:bg-red-900/30',
+    tone: 'settings-report-card-tone-danger',
+    bg: 'settings-report-card-bg-danger',
     active: reportFilters.value.status === 'failed',
   },
   {
     key: 'test',
     label: '测试汇报',
     value: reportLogStats.value.testCount,
-    tone: 'text-sky-700 dark:text-sky-300',
-    bg: 'bg-sky-100/80 dark:bg-sky-900/30',
+    tone: 'settings-report-card-tone-info',
+    bg: 'settings-report-card-bg-info',
     active: reportFilters.value.mode === 'test',
   },
   {
     key: 'hourly',
     label: '小时汇报',
     value: reportLogStats.value.hourlyCount,
-    tone: 'text-amber-700 dark:text-amber-300',
-    bg: 'bg-amber-100/80 dark:bg-amber-900/30',
+    tone: 'settings-report-card-tone-warning',
+    bg: 'settings-report-card-bg-warning',
     active: reportFilters.value.mode === 'hourly',
   },
   {
     key: 'daily',
     label: '日报',
     value: reportLogStats.value.dailyCount,
-    tone: 'text-violet-700 dark:text-violet-300',
-    bg: 'bg-violet-100/80 dark:bg-violet-900/30',
+    tone: 'settings-report-card-tone-accent',
+    bg: 'settings-report-card-bg-accent',
     active: reportFilters.value.mode === 'daily',
   },
 ])
@@ -198,6 +318,25 @@ const thirdPartyApiConfig = ref({
   aineisheKey: '',
 })
 const thirdPartyApiSaving = ref(false)
+const systemHealthLoading = ref(false)
+const systemHealthError = ref('')
+const systemHealthSnapshot = ref<SystemSettingsHealthSnapshot | null>(null)
+
+const webAssetsSnapshot = computed(() => systemHealthSnapshot.value?.webAssets ?? null)
+const systemHealthCheckedAtLabel = computed(() => formatTimestamp(systemHealthSnapshot.value?.checkedAt))
+const systemHealthStatusLabel = computed(() => {
+  if (!systemHealthSnapshot.value)
+    return '未加载'
+  return systemHealthSnapshot.value.ok ? '自检通过' : '存在待处理项'
+})
+const systemHealthStatusClass = computed(() => {
+  if (!systemHealthSnapshot.value)
+    return 'settings-health-pill settings-health-pill-neutral'
+  return systemHealthSnapshot.value.ok
+    ? 'settings-health-pill settings-health-pill-success'
+    : 'settings-health-pill settings-health-pill-warning'
+})
+void [webAssetsSnapshot, systemHealthCheckedAtLabel, systemHealthStatusLabel, systemHealthStatusClass]
 
 const trialCooldownOptions = [
   { label: '1 小时', value: 3600000 },
@@ -296,6 +435,43 @@ async function saveThirdPartyApiConfig() {
   }
 }
 
+function formatTimestamp(value?: number) {
+  if (!value)
+    return '未获取'
+  return new Date(value).toLocaleString('zh-CN', { hour12: false })
+}
+
+function describeWebAssetDir(dir: string | undefined, hasAssets: boolean | undefined, writable: boolean | undefined) {
+  const parts = [dir || '-']
+  parts.push(hasAssets ? '有产物' : '无产物')
+  parts.push(writable ? '可覆盖' : '不可覆盖')
+  return parts.join(' · ')
+}
+void describeWebAssetDir
+
+async function loadSystemSettingsHealth(showFailureAlert = false) {
+  if (!isAdmin.value)
+    return
+  systemHealthLoading.value = true
+  try {
+    const res = await api.get('/api/system-settings/health')
+    if (res.data?.ok) {
+      systemHealthSnapshot.value = (res.data.data || null) as SystemSettingsHealthSnapshot | null
+      systemHealthError.value = ''
+      return
+    }
+    throw new Error(res.data?.error || '系统自检返回异常')
+  }
+  catch (e: any) {
+    systemHealthError.value = e.response?.data?.error || e.message || '系统自检加载失败'
+    if (showFailureAlert)
+      showAlert(`加载系统自检失败: ${systemHealthError.value}`, 'danger')
+  }
+  finally {
+    systemHealthLoading.value = false
+  }
+}
+
 const modalVisible = ref(false)
 const modalConfig = ref({
   title: '',
@@ -333,17 +509,17 @@ const loginPreviewBackgroundStyle = computed(() => {
   }
 
   return {
-    background: 'linear-gradient(135deg, #eff6ff 0%, #e0e7ff 100%)',
+    background: 'linear-gradient(135deg, color-mix(in srgb, var(--ui-brand-100) 72%, var(--ui-bg-surface) 28%) 0%, color-mix(in srgb, var(--ui-brand-200) 58%, var(--ui-bg-surface) 42%) 100%)',
   }
 })
 
 const loginPreviewMaskStyle = computed(() => ({
-  backgroundColor: `rgba(0, 0, 0, ${appStore.loginBackgroundOverlayOpacity / 100})`,
+  backgroundColor: `color-mix(in srgb, var(--ui-overlay-backdrop) ${appStore.loginBackgroundOverlayOpacity}%, transparent)`,
   backdropFilter: `blur(${appStore.loginBackgroundBlur}px)`,
   WebkitBackdropFilter: `blur(${appStore.loginBackgroundBlur}px)`,
 }))
 const appScenePreviewMaskStyle = computed(() => ({
-  backgroundColor: `rgba(8, 12, 24, ${appStore.appBackgroundOverlayOpacity / 100})`,
+  backgroundColor: `color-mix(in srgb, var(--ui-overlay-backdrop) ${appStore.appBackgroundOverlayOpacity}%, transparent)`,
   backdropFilter: `blur(${appStore.appBackgroundBlur}px)`,
   WebkitBackdropFilter: `blur(${appStore.appBackgroundBlur}px)`,
 }))
@@ -376,23 +552,23 @@ const currentWorkspaceVisualSummary = computed(() => {
 function getWorkspacePreviewCardStyle(presetKey: string) {
   if (presetKey === 'poster') {
     return {
-      backgroundColor: 'rgba(255, 255, 255, 0.1)',
-      borderColor: 'rgba(255, 255, 255, 0.22)',
+      backgroundColor: 'color-mix(in srgb, var(--ui-text-on-brand) 10%, transparent)',
+      borderColor: 'color-mix(in srgb, var(--ui-text-on-brand) 22%, transparent)',
       backdropFilter: 'blur(22px)',
       WebkitBackdropFilter: 'blur(22px)',
     }
   }
   if (presetKey === 'pure_glass') {
     return {
-      backgroundColor: 'rgba(255, 255, 255, 0.07)',
-      borderColor: 'rgba(255, 255, 255, 0.3)',
+      backgroundColor: 'color-mix(in srgb, var(--ui-text-on-brand) 7%, transparent)',
+      borderColor: 'color-mix(in srgb, var(--ui-text-on-brand) 30%, transparent)',
       backdropFilter: 'blur(28px)',
       WebkitBackdropFilter: 'blur(28px)',
     }
   }
   return {
-    backgroundColor: 'rgba(255, 255, 255, 0.14)',
-    borderColor: 'rgba(255, 255, 255, 0.16)',
+    backgroundColor: 'color-mix(in srgb, var(--ui-text-on-brand) 14%, transparent)',
+    borderColor: 'color-mix(in srgb, var(--ui-text-on-brand) 16%, transparent)',
     backdropFilter: 'blur(18px)',
     WebkitBackdropFilter: 'blur(18px)',
   }
@@ -746,18 +922,18 @@ function resolveModeMeta(mode?: string) {
   if (mode === 'alt') {
     return {
       label: '小号',
-      badge: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+      badge: 'settings-mode-badge settings-mode-badge-warning',
     }
   }
   if (mode === 'safe') {
     return {
       label: '避险',
-      badge: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300',
+      badge: 'settings-mode-badge settings-mode-badge-success',
     }
   }
   return {
     label: '主号',
-    badge: 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300',
+    badge: 'settings-mode-badge settings-mode-badge-brand',
   }
 }
 
@@ -878,38 +1054,6 @@ const defaultAutomationConfig = {
   forceGetAllEnabled: false,
 }
 
-const defaultTradeConfig = {
-  sell: {
-    scope: 'fruit_only' as const,
-    keepMinEachFruit: 0,
-    keepFruitIds: [] as number[],
-    rareKeep: {
-      enabled: false,
-      judgeBy: 'either' as 'plant_level' | 'unit_price' | 'either',
-      minPlantLevel: 40,
-      minUnitPrice: 2000,
-    },
-    batchSize: 15,
-    previewBeforeManualSell: false,
-  },
-}
-
-function buildNormalizedTradeConfig(rawTradeConfig: any) {
-  const sellConfig = ((rawTradeConfig || {}).sell || {}) as any
-  const rareKeepConfig = (sellConfig.rareKeep || {}) as any
-  return {
-    sell: {
-      ...defaultTradeConfig.sell,
-      ...sellConfig,
-      keepFruitIds: Array.isArray(sellConfig.keepFruitIds) ? [...sellConfig.keepFruitIds] : [],
-      rareKeep: {
-        ...defaultTradeConfig.sell.rareKeep,
-        ...rareKeepConfig,
-      },
-    },
-  }
-}
-
 function buildNormalizedAutomationConfig(rawAutomation: any) {
   return {
     ...defaultAutomationConfig,
@@ -943,22 +1087,13 @@ function buildAccountSettingsStateFromSources() {
       ...defaultStakeoutSteal,
       ...((currentSettings?.stakeoutSteal) || {}),
     },
-    tradeConfig: buildNormalizedTradeConfig(currentSettings?.tradeConfig),
+    tradeConfig: normalizeTradeConfig(currentSettings?.tradeConfig),
     reportConfig: {
       ...defaultReportConfig,
       ...((currentSettings?.reportConfig) || {}),
     },
     automation: buildNormalizedAutomationConfig(currentSettings?.automation),
   }
-}
-
-function normalizeTradeKeepFruitIds(input: any) {
-  const rawItems = Array.isArray(input)
-    ? input
-    : String(input || '').split(/[\s,，]+/)
-  return Array.from(new Set(rawItems
-    .map(v => Number(v))
-    .filter(v => Number.isFinite(v) && v > 0)))
 }
 
 function buildSettingsPayloadFromState(state: any, keepFruitIdsSource?: any) {
@@ -986,7 +1121,7 @@ function buildSettingsPayloadFromState(state: any, keepFruitIdsSource?: any) {
     ...defaultStakeoutSteal,
     ...(payload.stakeoutSteal || {}),
   }
-  payload.tradeConfig = buildNormalizedTradeConfig(payload.tradeConfig)
+  payload.tradeConfig = normalizeTradeConfig(payload.tradeConfig)
   payload.tradeConfig.sell.keepFruitIds = ids
   payload.reportConfig = {
     ...defaultReportConfig,
@@ -1070,13 +1205,7 @@ const localSettings = ref({
   intervals: { ...defaultIntervals },
   friendQuietHours: { ...defaultFriendQuietHours },
   stakeoutSteal: { ...defaultStakeoutSteal },
-  tradeConfig: {
-    sell: {
-      ...defaultTradeConfig.sell,
-      keepFruitIds: [...defaultTradeConfig.sell.keepFruitIds],
-      rareKeep: { ...defaultTradeConfig.sell.rareKeep },
-    },
-  },
+  tradeConfig: createDefaultTradeConfig(),
   reportConfig: { ...defaultReportConfig },
   automation: {
     ...defaultAutomationConfig,
@@ -1101,10 +1230,10 @@ const currentModeExecutionMeta = computed(() => {
       effectiveMeta,
       statusBadge: {
         label: '协同命中',
-        badge: 'bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300',
+        badge: 'settings-mode-badge settings-mode-badge-info',
       },
       note: '同区 / 游戏好友约束已命中',
-      noteClass: 'text-sky-600 dark:text-sky-300',
+      noteClass: 'settings-mode-note-info',
     }
   }
 
@@ -1115,13 +1244,13 @@ const currentModeExecutionMeta = computed(() => {
       statusBadge: {
         label: '独立执行',
         badge: effectiveMode !== configuredMode
-          ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300'
-          : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200',
+          ? 'settings-mode-badge settings-mode-badge-warning'
+          : 'settings-mode-badge settings-mode-badge-neutral',
       },
       note: degradeLabel || '当前已按更保守模式执行',
       noteClass: effectiveMode !== configuredMode
-        ? 'text-amber-600 dark:text-amber-300'
-        : 'glass-text-muted',
+        ? 'settings-mode-note-warning'
+        : 'settings-mode-note-muted',
     }
   }
 
@@ -1336,11 +1465,22 @@ async function loadData() {
   if (isAdmin.value) {
     loadTimingConfig()
     loadClusterConfig()
+    loadSystemSettingsHealth()
+  }
+  else {
+    systemHealthSnapshot.value = null
+    systemHealthError.value = ''
   }
 }
 
-onMounted(() => {
-  loadData()
+onMounted(async () => {
+  await hydrateReportHistoryViewState()
+  await loadData()
+  reportHistoryViewSyncEnabled = true
+})
+
+onBeforeUnmount(() => {
+  clearReportHistoryViewSyncTimer()
 })
 
 // 【关键修复】仅监听 accountId 字符串值，而非 currentAccount 对象引用
@@ -1589,7 +1729,7 @@ let diffConfirmAction: null | (() => Promise<void>) = null
 const fieldLabels: Record<string, string> = {
   accountMode: '账号模式',
   farm: '自动种植收获',
-  task: '自动完成任务',
+  task: '自动任务领奖',
   sell: '自动卖果实',
   friend: '自动好友互动',
   farm_push: '推送触发巡田',
@@ -1996,7 +2136,9 @@ async function refreshReportLogs(options: { page?: number, pageSize?: number, re
   reportHistoryLoading.value = true
   try {
     const targetPage = options.resetPage ? 1 : (options.page || reportLogPagination.value.page || 1)
-    const targetPageSize = options.pageSize || reportPageSize.value || 10
+    const targetPageSize: typeof DEFAULT_REPORT_HISTORY_VIEW_STATE.pageSize = normalizeReportHistoryPageSize(
+      options.pageSize || reportPageSize.value || 10,
+    )
     const requestOptions = {
       mode: reportFilters.value.mode,
       status: reportFilters.value.status,
@@ -2011,7 +2153,7 @@ async function refreshReportLogs(options: { page?: number, pageSize?: number, re
       }),
       settingStore.fetchReportLogStats(currentAccountId.value, requestOptions),
     ])
-    reportPageSize.value = reportLogPagination.value.pageSize || reportPageSize.value || 10
+    reportPageSize.value = normalizeReportHistoryPageSize(reportLogPagination.value.pageSize || reportPageSize.value || 10)
   }
   finally {
     reportHistoryLoading.value = false
@@ -2273,6 +2415,8 @@ watch(() => [reportFilters.value.mode, reportFilters.value.status, reportSortOrd
   expandedReportLogIds.value = []
   selectedReportLogIds.value = []
   closeReportLogDetail()
+  if (reportHistoryViewHydrating)
+    return
   if (!currentAccountId.value)
     return
   void refreshReportLogs({ resetPage: true })
@@ -2282,6 +2426,8 @@ watch(() => reportPageSize.value, (pageSize, prevPageSize) => {
   expandedReportLogIds.value = []
   selectedReportLogIds.value = []
   closeReportLogDetail()
+  if (reportHistoryViewHydrating)
+    return
   if (!currentAccountId.value)
     return
   if (pageSize === prevPageSize)
@@ -2317,6 +2463,12 @@ watch(
   },
   { immediate: true },
 )
+
+watch(reportHistoryViewSignature, () => {
+  if (reportHistoryViewHydrating || !reportHistoryViewSyncEnabled)
+    return
+  scheduleReportHistoryViewSync()
+})
 
 async function loadTimingConfig() {
   if (!isAdmin.value)
@@ -2369,7 +2521,7 @@ async function restoreTimingDefaults() {
 </script>
 
 <template>
-  <div class="settings-page">
+  <div class="settings-page ui-page-shell">
     <div v-if="loading" class="glass-text-muted py-4 text-center">
       <div class="i-svg-spinners-ring-resize mx-auto mb-2 text-2xl" />
       <p>加载中...</p>
@@ -2391,28 +2543,28 @@ async function restoreTimingDefaults() {
           <div class="flex flex-wrap items-center gap-2">
             <span class="glass-text-muted mr-1 hidden text-xs lg:inline-block">预设:</span>
             <button
-              class="flex items-center gap-1 border border-primary-200 rounded-md bg-primary-50 px-2 py-1 text-xs text-primary-700 font-semibold transition dark:border-primary-800/50 dark:bg-primary-900/20 hover:bg-primary-100 dark:text-primary-400 dark:hover:bg-primary-900/40"
+              class="settings-preset-chip settings-preset-chip-brand"
               title="安全优先，最像真人"
               @click="applyPreset('conservative')"
             >
               <div class="i-carbon-security" /> 保守
             </button>
             <button
-              class="flex items-center gap-1 border border-blue-200 rounded-md bg-blue-50 px-2 py-1 text-xs text-blue-700 font-semibold transition dark:border-blue-800/50 dark:bg-blue-900/20 hover:bg-blue-100 dark:text-blue-400 dark:hover:bg-blue-900/40"
+              class="settings-preset-chip settings-preset-chip-info"
               title="推荐配置，收益与安全并重"
               @click="applyPreset('balanced')"
             >
               <div class="i-carbon-scales" /> 平衡
             </button>
             <button
-              class="flex items-center gap-1 border border-orange-200 rounded-md bg-orange-50 px-2 py-1 text-xs text-orange-700 font-semibold transition dark:border-orange-800/50 dark:bg-orange-900/20 hover:bg-orange-100 dark:text-orange-400 dark:hover:bg-orange-900/40"
+              class="settings-preset-chip settings-preset-chip-warning"
               title="收益优先，适合小号跑图"
               @click="applyPreset('aggressive')"
             >
               <div class="i-carbon-rocket" /> 激进
             </button>
 
-            <div class="mx-1 h-4 w-px bg-gray-300 dark:bg-gray-600" />
+            <div class="settings-toolbar-divider mx-1 h-4 w-px" />
 
             <BaseButton
               variant="primary"
@@ -2429,7 +2581,7 @@ async function restoreTimingDefaults() {
         <!-- Strategy Content -->
         <div class="p-4 space-y-3">
           <div class="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,260px)_1fr]">
-            <div class="border border-gray-200/70 rounded-xl bg-white/75 p-3 shadow-sm dark:border-gray-700/70 dark:bg-gray-900/40">
+            <div class="settings-mode-panel rounded-xl p-3 shadow-sm">
               <BaseSwitch
                 v-model="localSettings.riskPromptEnabled"
                 label="显示风控功能提示"
@@ -2439,13 +2591,13 @@ async function restoreTimingDefaults() {
             </div>
             <div
               v-if="localSettings.riskPromptEnabled"
-              class="bg-linear-to-br border border-sky-200/70 rounded-xl from-sky-50 via-cyan-50 to-white p-4 text-sm shadow-sm dark:border-sky-800/40 dark:from-sky-950/40 dark:via-cyan-950/20 dark:to-gray-900/30"
+              class="settings-mode-banner settings-mode-banner-info bg-linear-to-br rounded-xl p-4 text-sm shadow-sm"
             >
-              <div class="mb-2 flex items-center gap-2 text-sky-700 font-semibold dark:text-sky-300">
+              <div class="settings-mode-banner-title mb-2 flex items-center gap-2 font-semibold">
                 <div class="i-carbon-model-alt" />
                 主号 / 小号作用范围已按区服重构
               </div>
-              <div class="text-sky-900/80 leading-6 space-y-1.5 dark:text-sky-100/80">
+              <div class="settings-mode-banner-copy leading-6 space-y-1.5">
                 <div>当前账号区服：<strong>{{ currentAccountZoneLabel }}</strong>。QQ 区和微信区的数据互不打通，主号/小号关系只在同区内讨论。</div>
                 <div>协同前提：主号和小号必须互为<strong>游戏好友</strong>，否则“主小号协同”没有业务意义。</div>
                 <div>降级规则：若跨区或不是游戏好友，系统仍保留当前账号的运行策略，但会按<strong>独立账号</strong>理解，不再误套主小号联动。</div>
@@ -2453,14 +2605,14 @@ async function restoreTimingDefaults() {
             </div>
             <div
               v-if="localSettings.riskPromptEnabled"
-              class="border border-gray-200/70 rounded-xl bg-white/80 p-4 text-sm shadow-sm dark:border-gray-700/70 dark:bg-gray-900/40"
+              class="settings-mode-state-card rounded-xl p-4 text-sm shadow-sm"
             >
-              <div class="mb-2 flex items-center gap-2 text-gray-900 font-semibold dark:text-gray-100">
+              <div class="settings-mode-state-title mb-2 flex items-center gap-2 font-semibold">
                 <div class="i-carbon-chart-relationship" />
                 当前运行态判定
               </div>
               <div class="space-y-3">
-                <div class="text-gray-600 leading-6 dark:text-gray-300">
+                <div class="settings-mode-state-copy leading-6">
                   当前账号：<strong>{{ currentAccountName || currentAccountId || '未选中' }}</strong>
                 </div>
                 <div class="flex flex-wrap items-center gap-2">
@@ -2489,60 +2641,60 @@ async function restoreTimingDefaults() {
           <div class="grid grid-cols-1 mb-4 gap-3 md:grid-cols-3">
             <!-- 主号模式 -->
             <div
-              class="cursor-pointer border border-gray-200 rounded-lg bg-white p-3 transition-all duration-200 dark:border-gray-700 hover:border-primary-400 dark:bg-gray-800 dark:hover:border-primary-500"
-              :class="{ 'ring-2 ring-primary-500 bg-primary-50 dark:bg-primary-900/20 border-primary-500 dark:border-primary-500': localSettings.accountMode === 'main' }"
+              class="settings-mode-card settings-mode-card-brand cursor-pointer rounded-lg p-3 transition-all duration-200"
+              :class="{ 'settings-mode-card-active': localSettings.accountMode === 'main' }"
               @click="localSettings.accountMode = 'main'"
             >
               <div class="mb-1 flex items-center justify-between">
-                <div class="flex items-center gap-1 text-primary-600 font-bold dark:text-primary-400">
+                <div class="settings-mode-card-title flex items-center gap-1 font-bold">
                   <div class="i-carbon-user-avatar items-center" /> 主号模式
                 </div>
-                <div v-show="localSettings.accountMode === 'main'" class="i-carbon-checkmark-filled text-primary-500" />
+                <div v-show="localSettings.accountMode === 'main'" class="settings-mode-card-check i-carbon-checkmark-filled" />
               </div>
-              <div class="text-xs text-gray-500 leading-tight dark:text-gray-400">
+              <div class="settings-mode-card-copy text-xs leading-tight">
                 当前区服内的核心运营号；仅在同区且互为游戏好友时，才具备主号协同意义
               </div>
             </div>
             <!-- 小号模式 -->
             <div
-              class="cursor-pointer border border-gray-200 rounded-lg bg-white p-3 transition-all duration-200 dark:border-gray-700 hover:border-amber-400 dark:bg-gray-800 dark:hover:border-amber-500"
-              :class="{ 'ring-2 ring-amber-500 bg-amber-50 dark:bg-amber-900/20 border-amber-500 dark:border-amber-500': localSettings.accountMode === 'alt' }"
+              class="settings-mode-card settings-mode-card-warning cursor-pointer rounded-lg p-3 transition-all duration-200"
+              :class="{ 'settings-mode-card-active': localSettings.accountMode === 'alt' }"
               @click="localSettings.accountMode = 'alt'"
             >
               <div class="mb-1 flex items-center justify-between">
-                <div class="flex items-center gap-1 text-amber-600 font-bold dark:text-amber-400">
+                <div class="settings-mode-card-title flex items-center gap-1 font-bold">
                   <div class="i-carbon-user-multiple items-center" /> 小号模式
                 </div>
-                <div v-show="localSettings.accountMode === 'alt'" class="i-carbon-checkmark-filled text-amber-500" />
+                <div v-show="localSettings.accountMode === 'alt'" class="settings-mode-card-check i-carbon-checkmark-filled" />
               </div>
-              <div class="text-xs text-gray-500 leading-tight dark:text-gray-400">
+              <div class="settings-mode-card-copy text-xs leading-tight">
                 当前区服内的辅助号；默认延迟收获并抑制高仇恨动作，跨区或非好友时仅保留本号策略
               </div>
             </div>
             <!-- 风险规避模式 -->
             <div
-              class="cursor-pointer border border-gray-200 rounded-lg bg-white p-3 transition-all duration-200 dark:border-gray-700 hover:border-emerald-400 dark:bg-gray-800 dark:hover:border-emerald-500"
-              :class="{ 'ring-2 ring-emerald-500 bg-emerald-50 dark:bg-emerald-900/20 border-emerald-500 dark:border-emerald-500': localSettings.accountMode === 'safe' }"
+              class="settings-mode-card settings-mode-card-success cursor-pointer rounded-lg p-3 transition-all duration-200"
+              :class="{ 'settings-mode-card-active': localSettings.accountMode === 'safe' }"
               @click="localSettings.accountMode = 'safe'"
             >
               <div class="mb-1 flex items-center justify-between">
-                <div class="flex items-center gap-1 text-emerald-600 font-bold dark:text-emerald-400">
+                <div class="settings-mode-card-title flex items-center gap-1 font-bold">
                   <div class="i-carbon-security items-center" /> 风险规避
                 </div>
-                <div v-show="localSettings.accountMode === 'safe'" class="i-carbon-checkmark-filled text-emerald-500" />
+                <div v-show="localSettings.accountMode === 'safe'" class="settings-mode-card-check i-carbon-checkmark-filled" />
               </div>
-              <div class="text-xs text-gray-500 leading-tight dark:text-gray-400">
+              <div class="settings-mode-card-copy text-xs leading-tight">
                 敏感期防守号；压低高风险互动，不参与主小号协同，优先保证账号生存
               </div>
             </div>
           </div>
 
           <!-- 小号模式特供区：假延迟 -->
-          <div v-if="localSettings.accountMode === 'alt'" class="mb-4 flex flex-col gap-2 border border-amber-200 rounded-md bg-amber-50 p-3 dark:border-amber-800/50 dark:bg-amber-900/20">
-            <h4 class="flex items-center gap-1 text-sm text-amber-700 font-semibold dark:text-amber-400">
+          <div v-if="localSettings.accountMode === 'alt'" class="settings-mode-banner settings-mode-banner-warning mb-4 flex flex-col gap-2 rounded-md p-3">
+            <h4 class="settings-mode-banner-title flex items-center gap-1 text-sm font-semibold">
               <div class="i-carbon-time" /> 小号专属：收获延迟保护
             </h4>
-            <span v-if="localSettings.riskPromptEnabled" class="text-xs text-amber-600 dark:text-amber-500">当农作物成熟时，主动随机延后再收，降低被风控或与主号形成同秒轨迹的概率。</span>
+            <span v-if="localSettings.riskPromptEnabled" class="settings-mode-banner-copy text-xs">当农作物成熟时，主动随机延后再收，降低被风控或与主号形成同秒轨迹的概率。</span>
             <div class="grid grid-cols-2 mt-2 gap-3 md:grid-cols-4">
               <BaseInput
                 v-model.number="localSettings.harvestDelay.min"
@@ -2560,15 +2712,15 @@ async function restoreTimingDefaults() {
           </div>
 
           <!-- 风险规避特供区：一键分析拦截 -->
-          <div v-if="localSettings.accountMode === 'safe'" class="mb-4 flex flex-col items-start gap-2 border border-emerald-200 rounded-md bg-emerald-50 p-3 dark:border-emerald-800/50 dark:bg-emerald-900/20">
-            <h4 class="flex items-center gap-1 text-sm text-emerald-700 font-semibold dark:text-emerald-400">
+          <div v-if="localSettings.accountMode === 'safe'" class="settings-mode-banner settings-mode-banner-success mb-4 flex flex-col items-start gap-2 rounded-md p-3">
+            <h4 class="settings-mode-banner-title flex items-center gap-1 text-sm font-semibold">
               <div class="i-carbon-ibm-cloud-security-compliance-center" /> 风险规避专属护盾
             </h4>
-            <span v-if="localSettings.riskPromptEnabled" class="text-xs text-emerald-600 dark:text-emerald-500">此模式除自动关闭捣乱接口外，可进一步针对历史出现被封警告的号外置强阻断。</span>
+            <span v-if="localSettings.riskPromptEnabled" class="settings-mode-banner-copy text-xs">此模式除自动关闭捣乱接口外，可进一步针对历史出现被封警告的号外置强阻断。</span>
             <BaseButton
               variant="outline"
               size="sm"
-              class="mt-1 border-emerald-300 text-emerald-600 dark:border-emerald-700 hover:bg-emerald-100 dark:text-emerald-400 dark:hover:bg-emerald-800/50"
+              class="settings-mode-inline-action mt-1"
               :loading="safeChecking"
               @click="handleSafeCheck"
             >
@@ -2577,7 +2729,7 @@ async function restoreTimingDefaults() {
           </div>
 
           <!-- 极值警告 -->
-          <div v-if="localSettings.riskPromptEnabled && timeWarningVisible && !isAdmin" class="mb-3 flex items-start gap-2 border border-red-200 rounded-md bg-red-50 p-3 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
+          <div v-if="localSettings.riskPromptEnabled && timeWarningVisible && !isAdmin" class="settings-risk-alert mb-3 flex items-start gap-2 rounded-md p-3 text-sm">
             <div class="i-carbon-warning-alt mt-0.5 shrink-0 text-lg" />
             <div>
               <strong>危险的轮询设定！</strong><br>
@@ -2604,20 +2756,20 @@ async function restoreTimingDefaults() {
             />
             <div v-else class="flex flex-col gap-1">
               <span class="glass-text-muted text-xs">策略选种预览</span>
-              <div class="h-9 flex items-center border border-gray-200 rounded-md bg-gray-50/80 px-3 text-sm text-blue-600 font-bold dark:border-gray-600 dark:bg-gray-700/50 dark:text-blue-400">
+              <div class="settings-strategy-preview h-9 flex items-center rounded-md px-3 text-sm font-bold">
                 <div class="i-carbon-checkmark-filled mr-1.5 text-primary-500" />
                 {{ strategyPreviewLabel ?? '加载中...' }}
               </div>
             </div>
           </div>
 
-          <div class="border border-teal-200/70 rounded-xl bg-teal-50/70 p-4 dark:border-teal-800/40 dark:bg-teal-950/10">
+          <div class="settings-inventory-panel rounded-xl p-4">
             <div class="mb-3 flex items-center justify-between gap-3">
               <div>
-                <div class="text-sm text-teal-700 font-semibold dark:text-teal-300">
+                <div class="settings-inventory-title text-sm font-semibold">
                   库存优先种植
                 </div>
-                <div class="mt-1 text-xs text-teal-700/80 leading-5 dark:text-teal-200/70">
+                <div class="settings-inventory-copy mt-1 text-xs leading-5">
                   优先消耗背包现有种子。可按“全局保留数量 + 指定种子保留规则”决定哪些库存不参与自动种植。
                 </div>
               </div>
@@ -2645,7 +2797,7 @@ async function restoreTimingDefaults() {
                 <BaseButton
                   size="sm"
                   variant="outline"
-                  class="border-teal-300 text-teal-700 dark:border-teal-700 dark:text-teal-300"
+                  class="settings-inventory-action"
                   @click="addInventoryReserveRule"
                 >
                   <div class="i-carbon-add mr-1" /> 添加保留规则
@@ -2656,7 +2808,7 @@ async function restoreTimingDefaults() {
                 <div
                   v-for="(rule, index) in localSettings.inventoryPlanting.reserveRules"
                   :key="`inventory-rule-${index}`"
-                  class="grid grid-cols-1 gap-2 border border-teal-200/60 rounded-lg bg-white/70 p-3 md:grid-cols-[minmax(0,1fr)_140px_auto] dark:border-teal-800/30 dark:bg-slate-900/30"
+                  class="settings-inventory-rule grid grid-cols-1 gap-2 rounded-lg p-3 md:grid-cols-[minmax(0,1fr)_140px_auto]"
                 >
                   <BaseSelect
                     v-model="rule.seedId"
@@ -2673,7 +2825,7 @@ async function restoreTimingDefaults() {
                     <BaseButton
                       size="sm"
                       variant="ghost"
-                      class="text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20"
+                      class="settings-inventory-remove"
                       @click="removeInventoryReserveRule(index)"
                     >
                       <div class="i-carbon-trash-can mr-1" /> 删除
@@ -2681,7 +2833,7 @@ async function restoreTimingDefaults() {
                   </div>
                 </div>
               </div>
-              <div v-else class="border border-teal-300/70 rounded-lg border-dashed px-3 py-4 text-xs text-teal-700/75 dark:border-teal-700/40 dark:text-teal-200/70">
+              <div v-else class="settings-inventory-empty rounded-lg border-dashed px-3 py-4 text-xs">
                 当前没有指定种子保留规则，系统只使用“全局保留数量”。
               </div>
             </div>
@@ -2738,7 +2890,7 @@ async function restoreTimingDefaults() {
             />
           </div>
 
-          <div class="mt-4 flex flex-wrap items-center gap-4 border-t pt-3 dark:border-gray-700">
+          <div class="settings-section-divider mt-4 flex flex-wrap items-center gap-4 pt-3">
             <BaseSwitch
               v-model="localSettings.friendQuietHours.enabled"
               label="启用静默时段"
@@ -2760,13 +2912,13 @@ async function restoreTimingDefaults() {
             </div>
           </div>
 
-          <div class="mt-4 border-t pt-4 dark:border-gray-700">
+          <div class="settings-section-divider mt-4 pt-4">
             <div class="mb-3">
               <h4 class="text-sm font-semibold">
                 出售策略
               </h4>
-              <p class="mt-1 text-xs text-gray-500">
-                当前自动出售仅作用于果实类物品。可配置保留数量、指定白名单以及稀有果实保留规则。
+              <p class="settings-mode-card-copy mt-1 text-xs">
+                当前自动出售仅作用于果实类物品。可配置基础保留数量、强制保留清单以及稀有果实保留规则。
               </p>
             </div>
 
@@ -2776,6 +2928,7 @@ async function restoreTimingDefaults() {
                 label="每种果实至少保留"
                 type="number"
                 min="0"
+                max="999999"
               />
               <BaseInput
                 v-model.number="localSettings.tradeConfig.sell.batchSize"
@@ -2796,19 +2949,19 @@ async function restoreTimingDefaults() {
             </div>
 
             <div class="mt-3">
-              <label class="mb-1 block text-xs text-gray-500 font-semibold">
+              <label class="settings-mode-card-copy mb-1 block text-xs font-semibold">
                 强制保留果实 ID（逗号或空格分隔）
               </label>
               <textarea
                 v-model="tradeKeepFruitIdsText"
                 rows="2"
-                class="w-full border border-gray-200 rounded-lg bg-white/70 px-3 py-2 text-sm dark:border-gray-700 dark:bg-gray-900/40"
+                class="settings-trade-textarea w-full rounded-lg px-3 py-2 text-sm"
                 placeholder="例如：2001, 2002, 2003"
               />
             </div>
 
             <div class="grid grid-cols-1 mt-4 gap-3 md:grid-cols-2">
-              <div class="border border-gray-200/70 rounded-xl p-4 dark:border-gray-700/70">
+              <div class="settings-mode-panel rounded-xl p-4">
                 <BaseSwitch
                   v-model="localSettings.tradeConfig.sell.rareKeep.enabled"
                   label="启用稀有果实保留"
@@ -2819,6 +2972,7 @@ async function restoreTimingDefaults() {
                     label="最低作物等级"
                     type="number"
                     min="0"
+                    max="999"
                     :disabled="!localSettings.tradeConfig.sell.rareKeep.enabled"
                   />
                   <BaseInput
@@ -2826,17 +2980,18 @@ async function restoreTimingDefaults() {
                     label="最低单价"
                     type="number"
                     min="0"
+                    max="999999999"
                     :disabled="!localSettings.tradeConfig.sell.rareKeep.enabled"
                   />
                 </div>
               </div>
 
-              <div class="border border-gray-200/70 rounded-xl p-4 dark:border-gray-700/70">
+              <div class="settings-mode-panel rounded-xl p-4">
                 <BaseSwitch
                   v-model="localSettings.tradeConfig.sell.previewBeforeManualSell"
                   label="手动出售前先刷新预览"
                 />
-                <p class="mt-2 text-xs text-gray-500">
+                <p class="settings-mode-card-copy mt-2 text-xs">
                   背包页手动出售时会先刷新出售计划，避免在你改动保留策略后直接误卖。
                 </p>
               </div>
@@ -2845,7 +3000,7 @@ async function restoreTimingDefaults() {
         </div>
 
         <!-- Auto Control Header -->
-        <div class="border-b border-t border-gray-200/50 bg-transparent px-4 py-3 dark:border-gray-700/50">
+        <div class="settings-section-divider border-t bg-transparent px-4 py-3">
           <h3 class="glass-text-main flex items-center gap-2 text-base font-bold">
             <div class="i-fas-toggle-on" />
             自动控制
@@ -2857,7 +3012,7 @@ async function restoreTimingDefaults() {
           <!-- 分组网格 -->
           <div class="grid grid-cols-1 items-start gap-6 lg:grid-cols-3 md:grid-cols-2">
             <!-- 分组 1: 农场基础操作 -->
-            <div class="border border-gray-100/50 rounded-2xl bg-transparent p-5 transition-all dark:border-gray-700/50 hover:bg-gray-50/10">
+            <div class="settings-automation-card rounded-2xl p-5 transition-all">
               <h4 class="glass-text-muted mb-4 flex items-center text-xs font-bold tracking-widest uppercase">
                 <div class="i-carbon-agriculture-analytics mr-2" /> 农场基础操作
                 <BaseTooltip text="农场自动化的核心控制区，包含种植收获、好友互动、升级土地等基础功能" />
@@ -2880,7 +3035,7 @@ async function restoreTimingDefaults() {
                         class="w-16 shrink-0 text-sm shadow-inner !py-1"
                       />
                     </div>
-                    <p class="text-[10px] text-gray-500 dark:text-gray-400">
+                    <p class="settings-automation-note text-[10px]">
                       0=普通，6=蓝宝石
                     </p>
                   </div>
@@ -2891,14 +3046,14 @@ async function restoreTimingDefaults() {
             </div>
 
             <!-- 分组 2: 每日收益领取 -->
-            <div class="border border-gray-100/50 rounded-2xl bg-transparent p-5 transition-all dark:border-gray-700/50 hover:bg-gray-50/10">
+            <div class="settings-automation-card rounded-2xl p-5 transition-all">
               <h4 class="glass-text-muted mb-4 flex items-center text-xs font-bold tracking-widest uppercase">
                 <div class="i-carbon-gift mr-2" /> 每日收益领取
                 <BaseTooltip text="每日可领取的免费奖励，建议全部开启以最大化日常收益" />
               </h4>
               <div class="space-y-4">
                 <BaseSwitch v-model="localSettings.automation.free_gifts" label="自动商城礼包" hint="每日自动领取商城中的免费礼包（种子/化肥/装饰等），错过后次日才能再领。" recommend="on" />
-                <BaseSwitch v-model="localSettings.automation.task" label="自动完成任务" hint="自动完成每日任务并领取奖励（金币/经验/道具），是经验和金币的重要来源。" recommend="on" />
+                <BaseSwitch v-model="localSettings.automation.task" label="自动任务领奖" hint="自动领取每日任务、成长任务、活跃奖励；任务进度会随着种植、收菜、好友互动、分享等自动化行为自然推进。" recommend="on" />
                 <BaseSwitch v-model="localSettings.automation.share_reward" label="自动分享奖励" hint="自动触发分享操作并领取分享奖励，某些活动需分享才能获取额外收益。" recommend="on" />
                 <BaseSwitch v-model="localSettings.automation.email" label="自动领取邮件" hint="自动领取系统邮件中的附件奖励（活动奖励/补偿/系统礼品等）。" recommend="on" />
                 <div class="grid grid-cols-1 gap-4 pt-1">
@@ -2910,7 +3065,7 @@ async function restoreTimingDefaults() {
             </div>
 
             <!-- 分组 3: 化肥与杂项控制 -->
-            <div class="border border-gray-100/50 rounded-2xl bg-transparent p-5 transition-all dark:border-gray-700/50 hover:bg-gray-50/10">
+            <div class="settings-automation-card rounded-2xl p-5 transition-all">
               <h4 class="glass-text-muted mb-4 flex items-center text-xs font-bold tracking-widest uppercase">
                 <div class="i-carbon-tool-box mr-2" /> 化肥与精细控制
                 <BaseTooltip text="化肥管理和高级防盗功能的精细控制区" />
@@ -2934,8 +3089,8 @@ async function restoreTimingDefaults() {
                 <BaseSwitch v-model="localSettings.automation.fertilizer_60s_anti_steal" label="60秒施肥(防偷)" hint="核心防盗功能。在果实成熟前60秒内自动施肥催熟并瞬间收获，将被偷窗口压缩到接近0。需消耗化肥，主号必开。" recommend="on" />
                 <BaseSwitch v-model="localSettings.automation.fastHarvest" label="成熟秒收取" hint="在作物进入成熟前预设定时任务，约提前 200ms 发起收获请求，尽量压缩被偷窗口。和 60 秒施肥防偷可并存。" recommend="conditional" />
                 <BaseSwitch v-model="localSettings.automation.fertilizer_smart_phase" label="智能二季施肥" hint="开启后，二季作物刚种植时不会马上浪费化肥，而是等到耗时最长的黄金阶段再自动进行延期施肥，实现单果经验/金钱收益最大化。" recommend="conditional" />
-                <div class="border-t pt-2 dark:border-gray-700/50">
-                  <div class="mb-2 rounded-md bg-emerald-50/70 px-2.5 py-1.5 text-xs text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-300">
+                <div class="settings-section-divider pt-2">
+                  <div class="settings-automation-scope mb-2 rounded-md px-2.5 py-1.5 text-xs">
                     {{ fertilizerScopeText }}
                   </div>
                   <BaseSelect
@@ -2951,14 +3106,14 @@ async function restoreTimingDefaults() {
           </div>
 
           <!-- 好友互动详细控制 (始终显示，关闭时灰化) -->
-          <div class="relative border rounded-2xl p-5 transition-all" :class="localSettings.automation.friend ? 'border-blue-100/50 bg-blue-50/50 dark:border-blue-800/30 dark:bg-blue-900/10' : 'border-gray-200/30 bg-gray-100/20 dark:border-gray-700/30 dark:bg-gray-800/20'">
+          <div class="settings-friend-panel relative rounded-2xl p-5 transition-all" :class="localSettings.automation.friend ? 'settings-friend-panel-active' : 'settings-friend-panel-inactive'">
             <!-- 灰化遮罩：总开关关闭时覆盖内容区 -->
-            <div v-if="!localSettings.automation.friend" class="absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-black/30 backdrop-blur-[1px]">
-              <span class="border border-white/10 rounded-lg bg-black/50 px-4 py-2 text-sm text-gray-300 font-bold shadow-lg">
+            <div v-if="!localSettings.automation.friend" class="settings-friend-overlay absolute inset-0 z-10 flex items-center justify-center rounded-2xl">
+              <span class="settings-friend-overlay-badge rounded-lg px-4 py-2 text-sm font-bold shadow-lg">
                 🔒 请先开启上方「自动好友互动」总开关
               </span>
             </div>
-            <h4 class="mb-4 flex items-center text-xs font-bold tracking-widest uppercase" :class="localSettings.automation.friend ? 'text-blue-500' : 'text-gray-400'">
+            <h4 class="mb-4 flex items-center text-xs font-bold tracking-widest uppercase" :class="localSettings.automation.friend ? 'settings-friend-title-active' : 'settings-friend-title-inactive'">
               <div class="i-carbon-user-multiple mr-2" /> 社交互动详细策略
               <BaseTooltip text="只有在主开关【自动好友互动】开启时此策略组才会生效，控制在好友农场的具体行为。" />
             </h4>
@@ -2970,7 +3125,7 @@ async function restoreTimingDefaults() {
                 <template v-if="localSettings.stakeoutSteal.enabled">
                   <label class="inline-flex items-center gap-2">
                     <span class="glass-text-main select-none text-sm font-medium">蹲守延迟</span>
-                    <div class="flex items-center gap-1.5 border border-gray-300/50 rounded-md bg-black/5 px-2 py-1 dark:border-white/10 dark:bg-black/20">
+                    <div class="settings-stakeout-delay flex items-center gap-1.5 rounded-md px-2 py-1">
                       <input
                         v-model.number="localSettings.stakeoutSteal.delaySec"
                         type="number"
@@ -3390,7 +3545,7 @@ async function restoreTimingDefaults() {
                 </div>
 
                 <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-                  <div class="border border-emerald-200/60 rounded-xl bg-white/50 p-4 dark:border-emerald-800/30 dark:bg-black/10">
+                  <div class="settings-report-panel settings-report-panel-success rounded-xl p-4">
                     <BaseSwitch
                       v-model="localSettings.reportConfig.hourlyEnabled"
                       label="小时汇报"
@@ -3407,11 +3562,11 @@ async function restoreTimingDefaults() {
                         class="w-24 text-sm shadow-inner !py-1"
                         :disabled="!localSettings.reportConfig.hourlyEnabled"
                       />
-                      <span class="text-xs text-gray-500 dark:text-gray-400">分钟发送</span>
+                      <span class="settings-inline-unit text-xs">分钟发送</span>
                     </div>
                   </div>
 
-                  <div class="border border-emerald-200/60 rounded-xl bg-white/50 p-4 dark:border-emerald-800/30 dark:bg-black/10">
+                  <div class="settings-report-panel settings-report-panel-success rounded-xl p-4">
                     <BaseSwitch
                       v-model="localSettings.reportConfig.dailyEnabled"
                       label="每日汇报"
@@ -3428,7 +3583,7 @@ async function restoreTimingDefaults() {
                         class="w-24 text-sm shadow-inner !py-1"
                         :disabled="!localSettings.reportConfig.dailyEnabled"
                       />
-                      <span class="text-xs text-gray-500 dark:text-gray-400">时</span>
+                      <span class="settings-inline-unit text-xs">时</span>
                       <BaseInput
                         v-model.number="localSettings.reportConfig.dailyMinute"
                         type="number"
@@ -3437,13 +3592,13 @@ async function restoreTimingDefaults() {
                         class="w-24 text-sm shadow-inner !py-1"
                         :disabled="!localSettings.reportConfig.dailyEnabled"
                       />
-                      <span class="text-xs text-gray-500 dark:text-gray-400">分发送</span>
+                      <span class="settings-inline-unit text-xs">分发送</span>
                     </div>
                   </div>
                 </div>
 
-                <div class="border border-emerald-200/60 rounded-xl bg-white/50 p-4 dark:border-emerald-800/30 dark:bg-black/10">
-                  <div class="mb-2 flex items-center gap-2 text-xs text-emerald-700 font-bold tracking-widest uppercase dark:text-emerald-300">
+                <div class="settings-report-panel settings-report-panel-success rounded-xl p-4">
+                  <div class="settings-report-panel-title mb-2 flex items-center gap-2 text-xs font-bold tracking-widest uppercase">
                     <div class="i-carbon-data-base mr-1" /> 历史保留策略
                   </div>
                   <div class="flex items-center gap-3">
@@ -3455,16 +3610,16 @@ async function restoreTimingDefaults() {
                       max="365"
                       class="w-24 text-sm shadow-inner !py-1"
                     />
-                    <span class="text-xs text-gray-500 dark:text-gray-400">天</span>
+                    <span class="settings-inline-unit text-xs">天</span>
                   </div>
-                  <p class="mt-2 text-xs text-gray-500 leading-relaxed dark:text-gray-400">
+                  <p class="settings-report-meta mt-2 text-xs leading-relaxed">
                     填 <span class="font-bold">0</span> 表示不自动清理；填 1~365 表示系统每天自动清理一次过期汇报，并在每次发送后顺手回收当前账号的旧记录。
                   </p>
                 </div>
 
-                <div class="border-t border-emerald-200/60 pt-4 dark:border-emerald-800/30">
+                <div class="settings-report-divider pt-4">
                   <div class="mb-3 flex items-center justify-between gap-3">
-                    <h5 class="text-xs text-emerald-700 font-bold tracking-widest uppercase dark:text-emerald-300">
+                    <h5 class="settings-report-panel-title text-xs font-bold tracking-widest uppercase">
                       最近汇报记录
                     </h5>
                     <div class="flex flex-wrap gap-2">
@@ -3504,6 +3659,10 @@ async function restoreTimingDefaults() {
                     </div>
                   </div>
 
+                  <div class="settings-info-banner mb-3 rounded-xl px-3 py-2 text-xs leading-5">
+                    {{ REPORT_HISTORY_BROWSER_PREF_NOTE }}
+                  </div>
+
                   <div class="grid grid-cols-1 mb-3 gap-3 md:grid-cols-4">
                     <BaseSelect
                       v-model="reportFilters.mode"
@@ -3530,7 +3689,7 @@ async function restoreTimingDefaults() {
                   </div>
 
                   <div class="mb-3 flex flex-wrap items-end justify-between gap-3">
-                    <div class="text-xs text-gray-500 dark:text-gray-400">
+                    <div class="settings-report-meta text-xs">
                       <span v-if="reportKeyword.trim()">当前关键字：{{ reportKeyword.trim() }}</span>
                       <span v-else>未启用关键字搜索</span>
                     </div>
@@ -3580,30 +3739,30 @@ async function restoreTimingDefaults() {
                       v-for="item in reportHistoryStatsCards"
                       :key="item.key"
                       type="button"
-                      class="border border-emerald-200/60 rounded-xl px-3 py-3 text-left transition-all duration-150 dark:border-emerald-800/30"
+                      class="settings-report-stat-card rounded-xl px-3 py-3 text-left transition-all duration-150"
                       :class="[
                         item.bg,
                         item.active
-                          ? 'ring-2 ring-emerald-500/70 shadow-md dark:ring-emerald-400/60'
+                          ? 'settings-report-stat-card-active shadow-md'
                           : 'hover:-translate-y-0.5 hover:shadow-sm',
                       ]"
                       :title="`点击筛选${item.label}`"
                       @click="handleReportStatsCardClick(item.key)"
                     >
-                      <div class="flex items-center justify-between gap-2 text-[11px] text-gray-500 font-bold tracking-widest uppercase dark:text-gray-400">
+                      <div class="settings-report-stat-label flex items-center justify-between gap-2 text-[11px] font-bold tracking-widest uppercase">
                         <span>{{ item.label }}</span>
-                        <span v-if="item.active" class="text-emerald-600 dark:text-emerald-300">已筛选</span>
+                        <span v-if="item.active" class="settings-report-active">已筛选</span>
                       </div>
                       <div class="mt-2 text-2xl font-black" :class="item.tone">
                         {{ item.value }}
                       </div>
-                      <div class="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
+                      <div class="settings-report-stat-hint mt-1 text-[11px]">
                         点击快速筛选
                       </div>
                     </button>
                   </div>
 
-                  <div class="mb-3 flex flex-wrap items-center justify-between gap-3 text-xs text-gray-500 dark:text-gray-400">
+                  <div class="settings-report-selection mb-3 flex flex-wrap items-center justify-between gap-3 text-xs">
                     <div class="flex flex-wrap items-center gap-3">
                       <span>
                         共 {{ reportLogPagination.total }} 条记录，当前第 {{ reportLogPagination.page }} / {{ reportLogPagination.totalPages }} 页
@@ -3611,13 +3770,13 @@ async function restoreTimingDefaults() {
                       <label class="inline-flex select-none items-center gap-2">
                         <input
                           type="checkbox"
-                          class="h-4 w-4 border-gray-300 rounded text-emerald-600 focus:ring-emerald-500"
+                          class="settings-report-checkbox h-4 w-4 rounded"
                           :checked="allVisibleReportLogsSelected"
                           @change="toggleSelectAllVisibleReportLogs"
                         >
                         <span>全选当前页</span>
                       </label>
-                      <span v-if="selectedReportLogCount > 0" class="text-emerald-600 font-semibold dark:text-emerald-300">
+                      <span v-if="selectedReportLogCount > 0" class="settings-report-active font-semibold">
                         已选 {{ selectedReportLogCount }} 条
                       </span>
                     </div>
@@ -3641,11 +3800,11 @@ async function restoreTimingDefaults() {
                     </div>
                   </div>
 
-                  <div v-if="reportHistoryLoading" class="border border-emerald-200/70 rounded-xl border-dashed bg-white/40 px-4 py-5 text-center text-xs text-gray-500 dark:border-emerald-800/30 dark:bg-black/10 dark:text-gray-400">
+                  <div v-if="reportHistoryLoading" class="settings-report-empty rounded-xl px-4 py-5 text-center text-xs">
                     正在加载汇报历史...
                   </div>
 
-                  <div v-else-if="reportLogs.length === 0" class="border border-emerald-200/70 rounded-xl border-dashed bg-white/40 px-4 py-5 text-center text-xs text-gray-500 dark:border-emerald-800/30 dark:bg-black/10 dark:text-gray-400">
+                  <div v-else-if="reportLogs.length === 0" class="settings-report-empty rounded-xl px-4 py-5 text-center text-xs">
                     还没有经营汇报历史记录
                   </div>
 
@@ -3653,31 +3812,31 @@ async function restoreTimingDefaults() {
                     <div
                       v-for="item in reportLogs"
                       :key="item.id"
-                      class="border border-emerald-200/60 rounded-xl bg-white/50 p-4 dark:border-emerald-800/30 dark:bg-black/10"
+                      class="settings-report-log-card rounded-xl p-4"
                     >
                       <div class="flex flex-wrap items-start justify-between gap-2">
                         <div class="min-w-0 flex flex-1 items-start gap-3">
                           <label class="mt-0.5 inline-flex items-center">
                             <input
                               type="checkbox"
-                              class="h-4 w-4 border-gray-300 rounded text-emerald-600 focus:ring-emerald-500"
+                              class="settings-report-checkbox h-4 w-4 rounded"
                               :checked="isReportLogSelected(item.id)"
                               @change="toggleReportLogSelected(item.id)"
                             >
                           </label>
                           <div class="min-w-0 flex-1">
-                            <div class="truncate text-sm text-gray-900 font-semibold dark:text-gray-100">
+                            <div class="settings-report-log-title truncate text-sm font-semibold">
                               {{ item.title || '经营汇报' }}
                             </div>
-                            <div class="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
+                            <div class="settings-report-log-meta mt-1 text-[11px]">
                               {{ formatReportMode(item.mode) }} · {{ formatReportLogTime(item.createdAt) }} · {{ item.channel || 'unknown' }}
                             </div>
                           </div>
                         </div>
                         <div class="flex flex-wrap items-center gap-2">
                           <span
-                            class="rounded-full px-2 py-0.5 text-[11px] font-bold"
-                            :class="item.ok ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'"
+                            class="settings-result-badge rounded-full px-2 py-0.5 text-[11px] font-bold"
+                            :class="item.ok ? 'settings-result-badge-success' : 'settings-result-badge-danger'"
                           >
                             {{ item.ok ? '成功' : '失败' }}
                           </span>
@@ -3693,7 +3852,7 @@ async function restoreTimingDefaults() {
                       </div>
 
                       <div
-                        class="mt-3 overflow-auto whitespace-pre-line rounded-lg bg-black/5 px-3 py-2 text-xs text-gray-700 leading-5 dark:bg-white/5 dark:text-gray-300"
+                        class="settings-report-log-body mt-3 overflow-auto whitespace-pre-line rounded-lg px-3 py-2 text-xs leading-5"
                         :class="isReportLogExpanded(item.id) ? 'max-h-64' : 'max-h-24'"
                       >
                         {{ isReportLogExpanded(item.id) ? (item.content || '无正文') : getReportLogPreview(item.content) }}
@@ -3701,13 +3860,13 @@ async function restoreTimingDefaults() {
 
                       <div
                         v-if="item.errorMessage"
-                        class="mt-2 text-xs text-red-600 dark:text-red-400"
+                        class="settings-report-error mt-2 text-xs"
                       >
                         失败原因：{{ item.errorMessage }}
                       </div>
 
                       <div class="mt-3 flex flex-wrap items-center justify-between gap-2">
-                        <span class="text-[11px] text-gray-500 dark:text-gray-400">
+                        <span class="settings-report-state-note text-[11px]">
                           {{ isReportLogExpanded(item.id) ? '已展开完整正文' : '当前显示正文预览' }}
                         </span>
                         <div class="flex flex-wrap gap-2">
@@ -3734,6 +3893,133 @@ async function restoreTimingDefaults() {
             </div>
           </div>
         </template>
+      </div>
+
+      <div v-if="isAdmin" class="card glass-panel h-full flex flex-col rounded-lg shadow lg:col-span-2">
+        <div class="settings-section-divider flex items-center justify-between bg-transparent px-4 py-3">
+          <div>
+            <h3 class="glass-text-main flex items-center gap-2 text-base font-bold">
+              <div class="i-carbon-data-check" />
+              系统自检与前端产物状态
+            </h3>
+            <p class="settings-health-note mt-1 text-xs">
+              展示 `system_settings` 自检结果，以及当前面板实际使用的前端静态目录。
+            </p>
+          </div>
+          <BaseButton
+            variant="secondary"
+            size="sm"
+            :loading="systemHealthLoading"
+            @click="loadSystemSettingsHealth(true)"
+          >
+            <div class="i-carbon-renew mr-1" /> 刷新状态
+          </BaseButton>
+        </div>
+
+        <div class="p-4 space-y-4">
+          <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
+            <div class="settings-health-card rounded-xl p-4">
+              <div class="settings-health-card-label text-xs font-semibold tracking-wide uppercase">
+                system_settings
+              </div>
+              <div class="mt-2">
+                <span class="inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold" :class="systemHealthStatusClass">
+                  {{ systemHealthStatusLabel }}
+                </span>
+              </div>
+            </div>
+
+            <div class="settings-health-card rounded-xl p-4">
+              <div class="settings-health-card-label text-xs font-semibold tracking-wide uppercase">
+                最近检查时间
+              </div>
+              <div class="settings-health-card-value mt-2 text-sm font-medium">
+                {{ systemHealthCheckedAtLabel }}
+              </div>
+            </div>
+
+            <div class="settings-health-card rounded-xl p-4">
+              <div class="settings-health-card-label text-xs font-semibold tracking-wide uppercase">
+                当前选路原因
+              </div>
+              <div class="settings-health-card-value mt-2 text-sm font-medium">
+                {{ webAssetsSnapshot?.selectionReasonLabel || '未获取' }}
+              </div>
+            </div>
+          </div>
+
+          <div v-if="systemHealthError" class="settings-health-alert flex items-start gap-2 rounded-xl p-4 text-sm">
+            <div class="i-carbon-warning-alt mt-0.5 shrink-0 text-base" />
+            <div>{{ systemHealthError }}</div>
+          </div>
+
+          <template v-if="webAssetsSnapshot">
+            <div class="settings-health-primary-card rounded-xl p-4">
+              <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div>
+                  <div class="settings-health-primary-label text-xs font-semibold tracking-wide uppercase">
+                    当前服务目录
+                  </div>
+                  <code class="settings-health-primary-code mt-2 block text-sm font-semibold">{{ webAssetsSnapshot.activeDir }}</code>
+                  <div class="settings-health-primary-note mt-1 text-xs">
+                    来源：{{ webAssetsSnapshot.activeSource }}
+                  </div>
+                </div>
+                <div>
+                  <div class="settings-health-primary-label text-xs font-semibold tracking-wide uppercase">
+                    当前构建目标
+                  </div>
+                  <code class="settings-health-primary-code mt-2 block text-sm font-semibold">{{ webAssetsSnapshot.buildTargetDir }}</code>
+                  <div class="settings-health-primary-note mt-1 text-xs">
+                    输出来源：{{ webAssetsSnapshot.buildTargetSource }}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+              <div class="settings-health-card rounded-xl p-4">
+                <div class="settings-health-card-label text-xs font-semibold tracking-wide uppercase">
+                  默认目录
+                </div>
+                <code class="settings-health-card-value mt-2 block text-sm font-semibold">{{ webAssetsSnapshot.defaultDir }}</code>
+                <div class="settings-health-card-note mt-2 text-xs">
+                  {{ describeWebAssetDir(webAssetsSnapshot.defaultDir, webAssetsSnapshot.defaultHasAssets, webAssetsSnapshot.defaultWritable) }}
+                </div>
+              </div>
+
+              <div class="settings-health-card rounded-xl p-4">
+                <div class="settings-health-card-label text-xs font-semibold tracking-wide uppercase">
+                  回退目录
+                </div>
+                <code class="settings-health-card-value mt-2 block text-sm font-semibold">{{ webAssetsSnapshot.fallbackDir }}</code>
+                <div class="settings-health-card-note mt-2 text-xs">
+                  {{ describeWebAssetDir(webAssetsSnapshot.fallbackDir, webAssetsSnapshot.fallbackHasAssets, webAssetsSnapshot.fallbackWritable) }}
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+            <div class="settings-health-status-card rounded-xl p-4" :class="(systemHealthSnapshot?.missingRequiredKeys?.length || 0) > 0 ? 'settings-health-status-card-warning' : 'settings-health-status-card-success'">
+              <div class="settings-health-status-label text-xs font-semibold tracking-wide uppercase">
+                必需键缺失
+              </div>
+              <div class="settings-health-status-value mt-2 text-sm font-medium">
+                {{ systemHealthSnapshot?.missingRequiredKeys?.length ? systemHealthSnapshot.missingRequiredKeys.join('、') : '无' }}
+              </div>
+            </div>
+
+            <div class="settings-health-status-card rounded-xl p-4" :class="(systemHealthSnapshot?.fallbackWouldActivateKeys?.length || 0) > 0 ? 'settings-health-status-card-info' : 'settings-health-status-card-neutral'">
+              <div class="settings-health-status-label text-xs font-semibold tracking-wide uppercase">
+                仍依赖旧回退文件的键
+              </div>
+              <div class="settings-health-status-value mt-2 text-sm font-medium">
+                {{ systemHealthSnapshot?.fallbackWouldActivateKeys?.length ? systemHealthSnapshot.fallbackWouldActivateKeys.join('、') : '无' }}
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- Card Time Parameters: 系统级时间参数调优（仅管理员可见） -->
@@ -4127,24 +4413,24 @@ async function restoreTimingDefaults() {
                     每套方案都会同步主题色、背景图、登录页参数、主界面参数和业务页卡片风格，并默认启用“登录页 + 主界面”。
                   </p>
                 </div>
-                <div class="rounded-full bg-white/10 px-3 py-1 text-[11px] text-primary-500 dark:bg-black/20">
+                <div class="rounded-full bg-primary-500/10 px-3 py-1 text-[11px] text-primary-600 dark:bg-black/20 dark:text-primary-300">
                   一键套用整套皮肤
                 </div>
               </div>
 
-              <div class="grid grid-cols-1 mt-4 gap-4 md:grid-cols-2 xl:grid-cols-5">
+              <div class="grid grid-cols-[repeat(auto-fit,minmax(11.5rem,1fr))] mt-4 gap-4">
                 <button
                   v-for="bundle in themePresetBundles"
                   :key="bundle.theme.key"
                   type="button"
-                  class="group overflow-hidden border rounded-2xl bg-black/5 text-left transition-all duration-300 dark:bg-white/5 hover:shadow-xl hover:-translate-y-1"
+                  class="settings-theme-bundle-card group overflow-hidden border rounded-2xl bg-black/5 text-left transition-all duration-300 dark:bg-white/5 hover:shadow-xl hover:-translate-y-1"
                   :class="isThemeBundleApplied(bundle.theme.key)
                     ? 'border-primary-500 shadow-lg shadow-primary-500/15'
                     : 'border-white/10 dark:border-white/10'"
                   @click="applyThemeBundle(bundle.theme.key)"
                 >
                   <div
-                    class="relative h-28 overflow-hidden"
+                    class="settings-theme-bundle-cover relative h-28 overflow-hidden"
                     :style="{
                       backgroundImage: `url(${bundle.preset.url})`,
                       backgroundSize: 'cover',
@@ -4154,7 +4440,7 @@ async function restoreTimingDefaults() {
                     <div
                       class="absolute inset-0"
                       :style="{
-                        backgroundColor: `rgba(0, 0, 0, ${bundle.preset.overlayOpacity / 100})`,
+                        backgroundColor: `color-mix(in srgb, var(--ui-overlay-backdrop) ${bundle.preset.overlayOpacity}%, transparent)`,
                         backdropFilter: `blur(${bundle.preset.blur}px)`,
                         WebkitBackdropFilter: `blur(${bundle.preset.blur}px)`,
                       }"
@@ -4167,35 +4453,35 @@ async function restoreTimingDefaults() {
                           boxShadow: `0 0 0 4px ${bundle.theme.color}22`,
                         }"
                       />
-                      <span class="border border-white/20 rounded-full bg-black/25 px-2.5 py-1 text-[10px] text-white/90 backdrop-blur-md">
+                      <span class="settings-theme-bundle-badge border border-white/20 rounded-full bg-black/35 px-2.5 py-1 text-[10px] text-white backdrop-blur-md">
                         {{ bundle.theme.name }}
                       </span>
                     </div>
-                    <div class="absolute bottom-3 right-3 border border-white/20 rounded-full bg-black/25 px-2.5 py-1 text-[10px] text-white/90 backdrop-blur-md">
+                    <div class="settings-theme-bundle-badge absolute bottom-3 right-3 border border-white/20 rounded-full bg-black/35 px-2.5 py-1 text-[10px] text-white backdrop-blur-md">
                       {{ bundle.preset.title }}
                     </div>
                   </div>
 
-                  <div class="p-3 space-y-2">
-                    <div class="flex items-center justify-between gap-3">
-                      <span class="glass-text-main text-sm font-semibold">{{ bundle.preset.title }}</span>
+                  <div class="settings-theme-bundle-body p-3 space-y-2">
+                    <div class="settings-theme-bundle-head flex items-start justify-between gap-3">
+                      <span class="settings-theme-bundle-title glass-text-main text-sm font-semibold">{{ bundle.preset.title }}</span>
                       <span
-                        class="rounded-full px-2 py-0.5 text-[10px] font-bold"
+                        class="settings-theme-bundle-action rounded-full px-2 py-0.5 text-[10px] font-bold"
                         :class="isThemeBundleApplied(bundle.theme.key)
                           ? 'bg-primary-500/15 text-primary-500'
-                          : 'bg-white/10 text-gray-300 dark:bg-black/20 dark:text-gray-200'"
+                          : 'bg-white/70 text-gray-700 dark:bg-black/20 dark:text-gray-200'"
                       >
                         {{ isThemeBundleApplied(bundle.theme.key) ? '当前整套' : '点击套用' }}
                       </span>
                     </div>
-                    <p class="glass-text-muted text-xs leading-5">
+                    <p class="settings-theme-bundle-desc glass-text-muted text-xs leading-5">
                       {{ bundle.preset.description }}
                     </p>
-                    <div class="glass-text-muted flex items-center justify-between text-[11px]">
+                    <div class="settings-theme-bundle-metrics glass-text-muted flex items-center justify-between text-[11px]">
                       <span>登录 {{ bundle.preset.overlayOpacity }}% / {{ bundle.preset.blur }}px</span>
                       <span>主界面 {{ bundle.preset.appOverlayOpacity }}% / {{ bundle.preset.appBlur }}px</span>
                     </div>
-                    <div class="glass-text-muted text-[11px]">
+                    <div class="settings-theme-bundle-foot glass-text-muted text-[11px]">
                       业务页风格 {{ bundle.workspacePreset.name }}
                     </div>
                   </div>
@@ -4254,7 +4540,10 @@ async function restoreTimingDefaults() {
                     : 'border-white/10 dark:border-white/10'"
                   @click="applyWorkspaceVisualPreset(preset.key)"
                 >
-                  <div class="relative h-24 overflow-hidden border border-white/10 rounded-2xl bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.14),transparent_58%),linear-gradient(180deg,rgba(255,255,255,0.08),rgba(15,23,42,0.22))] p-3">
+                  <div
+                    class="relative h-24 overflow-hidden border border-white/10 rounded-2xl p-3"
+                    :style="{ background: 'radial-gradient(circle at top, color-mix(in srgb, var(--ui-text-on-brand) 14%, transparent), transparent 58%), linear-gradient(180deg, color-mix(in srgb, var(--ui-text-on-brand) 8%, transparent), color-mix(in srgb, var(--ui-bg-canvas) 22%, transparent))' }"
+                  >
                     <div class="absolute inset-0 from-white/10 via-transparent to-black/20 bg-gradient-to-br" />
                     <div class="relative z-10 h-full flex gap-3">
                       <div class="w-12 border rounded-xl p-2" :style="getWorkspacePreviewCardStyle(preset.key)">
@@ -4428,7 +4717,7 @@ async function restoreTimingDefaults() {
               <span class="glass-text-muted text-xs font-medium">预览 (效果参考)</span>
               <button
                 type="button"
-                class="glass-text-main border border-white/20 rounded-full bg-white/15 px-3 py-1 text-[11px] transition-all dark:border-white/10 dark:bg-black/20 hover:bg-white/25 dark:hover:bg-black/35"
+                class="settings-preview-trigger glass-text-main rounded-full px-3 py-1 text-[11px] transition-all"
                 @click="openLoginPreview"
               >
                 打开全屏预览
@@ -4437,36 +4726,36 @@ async function restoreTimingDefaults() {
 
             <button
               type="button"
-              class="group relative h-40 w-full overflow-hidden border border-white/20 rounded-2xl text-left shadow-sm transition-all duration-300 dark:border-white/10 hover:shadow-black/10 hover:shadow-lg"
+              class="settings-preview-card group relative h-40 w-full overflow-hidden rounded-2xl text-left shadow-sm transition-all duration-300 hover:shadow-lg"
               :style="loginPreviewBackgroundStyle"
               @click="openLoginPreview"
             >
               <div v-if="loginPreviewUsesCustomBackground" class="absolute inset-0" :style="loginPreviewMaskStyle" />
               <div class="absolute inset-0 from-black/35 via-transparent to-white/10 bg-gradient-to-t opacity-80" />
               <div class="absolute inset-0 flex items-center justify-center">
-                <div class="glass-text-main border border-white/25 rounded-xl bg-white/55 px-4 py-2 text-xs font-medium shadow-lg backdrop-blur-md transition-transform duration-300 group-hover:scale-105 dark:bg-black/40 dark:text-white">
+                <div class="settings-preview-glass glass-text-main rounded-xl px-4 py-2 text-xs font-medium shadow-lg transition-transform duration-300 group-hover:scale-105">
                   玻璃拟态预览
                 </div>
               </div>
-              <div class="absolute bottom-3 left-3 border border-white/20 rounded-full bg-black/25 px-2.5 py-1 text-[10px] text-white/90 backdrop-blur-md">
+              <div class="settings-preview-chip absolute bottom-3 left-3 rounded-full px-2.5 py-1 text-[10px]">
                 遮罩 {{ appStore.loginBackgroundOverlayOpacity }}%
               </div>
-              <div class="absolute bottom-3 right-3 border border-white/20 rounded-full bg-black/25 px-2.5 py-1 text-[10px] text-white/90 backdrop-blur-md">
+              <div class="settings-preview-chip absolute bottom-3 right-3 rounded-full px-2.5 py-1 text-[10px]">
                 模糊 {{ appStore.loginBackgroundBlur }}px
               </div>
             </button>
 
             <div
-              class="relative h-36 overflow-hidden border border-white/20 rounded-2xl dark:border-white/10"
+              class="settings-preview-card relative h-36 overflow-hidden rounded-2xl"
               :style="loginPreviewBackgroundStyle"
             >
               <div v-if="loginPreviewUsesCustomBackground" class="absolute inset-0" :style="appScenePreviewMaskStyle" />
               <div class="absolute inset-0 from-white/10 via-transparent to-black/20 bg-gradient-to-br" />
-              <div class="absolute left-3 top-3 border border-white/20 rounded-full bg-black/25 px-2.5 py-1 text-[10px] text-white/90 backdrop-blur-md">
+              <div class="settings-preview-chip absolute left-3 top-3 rounded-full px-2.5 py-1 text-[10px]">
                 主界面氛围预览
               </div>
               <div class="absolute inset-0 flex gap-3 p-4">
-                <div class="w-20 border border-white/15 rounded-2xl bg-white/12 p-3 backdrop-blur-xl">
+                <div class="settings-preview-sidebar w-20 rounded-2xl p-3">
                   <div class="mb-3 h-6 w-6 rounded-lg bg-white/70" />
                   <div class="space-y-2">
                     <div class="h-2 rounded bg-white/40" />
@@ -4475,16 +4764,16 @@ async function restoreTimingDefaults() {
                   </div>
                 </div>
                 <div class="flex flex-1 flex-col gap-3">
-                  <div class="border border-white/15 rounded-2xl bg-white/14 p-3 backdrop-blur-xl">
+                  <div class="settings-preview-panel rounded-2xl p-3">
                     <div class="h-3 w-36 rounded bg-white/55" />
                   </div>
                   <div class="grid grid-cols-2 flex-1 gap-3">
-                    <div class="border border-white/15 rounded-2xl bg-white/12 p-3 backdrop-blur-xl" />
-                    <div class="border border-white/15 rounded-2xl bg-white/12 p-3 backdrop-blur-xl" />
+                    <div class="settings-preview-panel rounded-2xl p-3" />
+                    <div class="settings-preview-panel rounded-2xl p-3" />
                   </div>
                 </div>
               </div>
-              <div class="absolute bottom-3 right-3 border border-white/20 rounded-full bg-black/25 px-2.5 py-1 text-[10px] text-white/90 backdrop-blur-md">
+              <div class="settings-preview-chip absolute bottom-3 right-3 rounded-full px-2.5 py-1 text-[10px]">
                 {{ appStore.backgroundScope === 'login_only' ? '当前未对主界面启用' : `遮罩 ${appStore.appBackgroundOverlayOpacity}% / 模糊 ${appStore.appBackgroundBlur}px` }}
               </div>
             </div>
@@ -4531,21 +4820,21 @@ async function restoreTimingDefaults() {
                 class="relative h-32 overflow-hidden"
                 :style="preset.url
                   ? { backgroundImage: `url(${preset.url})`, backgroundSize: 'cover', backgroundPosition: 'center' }
-                  : { background: 'linear-gradient(135deg, #eff6ff 0%, #e0e7ff 100%)' }"
+                  : { background: 'linear-gradient(135deg, color-mix(in srgb, var(--ui-brand-100) 72%, var(--ui-bg-surface) 28%) 0%, color-mix(in srgb, var(--ui-brand-200) 58%, var(--ui-bg-surface) 42%) 100%)' }"
               >
                 <div
                   v-if="preset.url"
                   class="absolute inset-0"
                   :style="{
-                    backgroundColor: `rgba(0, 0, 0, ${preset.overlayOpacity / 100})`,
+                    backgroundColor: `color-mix(in srgb, var(--ui-overlay-backdrop) ${preset.overlayOpacity}%, transparent)`,
                     backdropFilter: `blur(${preset.blur}px)`,
                     WebkitBackdropFilter: `blur(${preset.blur}px)`,
                   }"
                 />
-                <div class="absolute left-3 top-3 border border-white/20 rounded-full bg-black/25 px-2.5 py-1 text-[10px] text-white/90 backdrop-blur-md">
+                <div class="absolute left-3 top-3 border border-white/20 rounded-full bg-black/35 px-2.5 py-1 text-[10px] text-white backdrop-blur-md">
                   {{ preset.themeKey === appStore.colorTheme ? '当前主题推荐' : (preset.badge || '预设') }}
                 </div>
-                <div class="absolute bottom-3 right-3 border border-white/20 rounded-full bg-black/25 px-2.5 py-1 text-[10px] text-white/90 backdrop-blur-md">
+                <div class="absolute bottom-3 right-3 border border-white/20 rounded-full bg-black/35 px-2.5 py-1 text-[10px] text-white backdrop-blur-md">
                   {{ preset.overlayOpacity }}% / {{ preset.blur }}px
                 </div>
               </div>
@@ -4575,11 +4864,11 @@ async function restoreTimingDefaults() {
     <Teleport to="body">
       <div v-if="loginPreviewVisible" class="fixed inset-0 z-50 flex items-center justify-center p-4">
         <div
-          class="absolute inset-0 bg-black/65 backdrop-blur-md"
+          class="settings-preview-overlay absolute inset-0 backdrop-blur-md"
           @click="loginPreviewVisible = false"
         />
 
-        <div class="relative z-10 max-h-[90vh] max-w-6xl w-full overflow-hidden border border-white/20 rounded-[28px] shadow-2xl dark:border-white/10">
+        <div class="settings-preview-modal relative z-10 max-h-[90vh] max-w-6xl w-full overflow-hidden rounded-[28px] shadow-2xl">
           <div
             class="relative min-h-[78vh] overflow-hidden"
             :style="loginPreviewBackgroundStyle"
@@ -4587,16 +4876,16 @@ async function restoreTimingDefaults() {
             <div v-if="loginPreviewUsesCustomBackground" class="absolute inset-0" :style="loginPreviewMaskStyle" />
             <div v-else class="absolute inset-0 from-white/10 via-transparent to-black/5 bg-gradient-to-br" />
 
-            <div class="absolute left-5 top-5 z-20 border border-white/20 rounded-full bg-black/25 px-4 py-1.5 text-xs text-white/90 backdrop-blur-md">
+            <div class="settings-preview-chip absolute left-5 top-5 z-20 rounded-full px-4 py-1.5 text-xs">
               登录页玻璃拟态预览
             </div>
-            <div class="absolute left-5 top-16 z-20 border border-white/20 rounded-full bg-black/25 px-4 py-1.5 text-xs text-white/90 backdrop-blur-md">
+            <div class="settings-preview-chip absolute left-5 top-16 z-20 rounded-full px-4 py-1.5 text-xs">
               遮罩 {{ appStore.loginBackgroundOverlayOpacity }}% · 模糊 {{ appStore.loginBackgroundBlur }}px
             </div>
 
             <button
               type="button"
-              class="absolute right-5 top-5 z-20 h-10 w-10 flex items-center justify-center border border-white/20 rounded-full bg-black/25 text-white/90 backdrop-blur-md transition-colors hover:bg-black/40"
+              class="settings-preview-close absolute right-5 top-5 z-20 h-10 w-10 flex items-center justify-center rounded-full transition-colors"
               @click="loginPreviewVisible = false"
             >
               <div class="i-carbon-close text-lg" />
@@ -4604,27 +4893,27 @@ async function restoreTimingDefaults() {
 
             <div class="relative z-10 min-h-[78vh] flex items-center justify-center px-5 py-12 lg:px-10">
               <div class="grid max-w-5xl w-full gap-6 lg:grid-cols-[1.1fr_0.9fr]">
-                <div class="hidden border border-white/20 rounded-[28px] bg-white/10 p-8 text-white shadow-2xl backdrop-blur-xl lg:flex lg:flex-col lg:justify-between">
+                <div class="settings-preview-brand-panel hidden rounded-[28px] p-8 shadow-2xl lg:flex lg:flex-col lg:justify-between">
                   <div>
-                    <div class="mb-6 h-16 w-16 flex items-center justify-center rounded-3xl bg-white text-emerald-500 shadow-xl">
+                    <div class="settings-preview-brand-icon mb-6 h-16 w-16 flex items-center justify-center rounded-3xl shadow-xl">
                       <div class="i-carbon-sprout text-3xl" />
                     </div>
                     <h3 class="text-3xl font-black tracking-tight">
                       御农·QQ 农场智能助手
                     </h3>
-                    <p class="mt-3 max-w-md text-sm text-white/80 leading-6">
+                    <p class="settings-preview-brand-copy mt-3 max-w-md text-sm leading-6">
                       这里模拟的是登录页左侧品牌区和右侧表单卡片的叠层效果，主要用来判断背景图是否会干扰按钮、标题和输入区可读性。
                     </p>
                   </div>
 
                   <div class="grid grid-cols-2 gap-3">
-                    <div class="border border-white/15 rounded-2xl bg-white/10 p-4">
+                    <div class="settings-preview-brand-card rounded-2xl p-4">
                       <div class="i-carbon-flash mb-2 text-xl" />
                       <div class="text-sm font-semibold">
                         极速自动化
                       </div>
                     </div>
-                    <div class="border border-white/15 rounded-2xl bg-white/10 p-4">
+                    <div class="settings-preview-brand-card rounded-2xl p-4">
                       <div class="i-carbon-security mb-2 text-xl" />
                       <div class="text-sm font-semibold">
                         安全隔离
@@ -4633,37 +4922,37 @@ async function restoreTimingDefaults() {
                   </div>
                 </div>
 
-                <div class="border border-white/25 rounded-[28px] bg-white/18 p-5 shadow-2xl backdrop-blur-2xl dark:bg-black/25 lg:p-8">
+                <div class="settings-preview-form-panel rounded-[28px] p-5 shadow-2xl lg:p-8">
                   <div class="mx-auto max-w-md">
-                    <div class="mb-6 flex items-center gap-3 text-white">
-                      <div class="h-11 w-11 flex items-center justify-center rounded-2xl bg-white/80 text-emerald-500 shadow-lg">
+                    <div class="settings-preview-form-header mb-6 flex items-center gap-3">
+                      <div class="settings-preview-form-icon h-11 w-11 flex items-center justify-center rounded-2xl shadow-lg">
                         <div class="i-carbon-sprout text-xl" />
                       </div>
                       <div>
                         <div class="text-lg font-bold">
                           欢迎回来
                         </div>
-                        <div class="text-xs text-white/80">
+                        <div class="settings-preview-form-copy text-xs">
                           预览背景图在真实登录页中的玻璃卡片表现
                         </div>
                       </div>
                     </div>
 
                     <div class="space-y-4">
-                      <div class="border border-white/20 rounded-2xl bg-white/35 px-4 py-3 text-sm text-white/85 backdrop-blur-md dark:bg-black/25">
+                      <div class="settings-preview-input rounded-2xl px-4 py-3 text-sm">
                         用户名 / 账号
                       </div>
-                      <div class="border border-white/20 rounded-2xl bg-white/35 px-4 py-3 text-sm text-white/85 backdrop-blur-md dark:bg-black/25">
+                      <div class="settings-preview-input rounded-2xl px-4 py-3 text-sm">
                         密码
                       </div>
-                      <div class="rounded-2xl bg-white/85 px-4 py-3 text-center text-sm text-slate-800 font-bold shadow-lg">
+                      <div class="settings-preview-submit rounded-2xl px-4 py-3 text-center text-sm font-bold shadow-lg">
                         登录按钮预览
                       </div>
-                      <div class="grid grid-cols-2 gap-3 text-center text-xs text-white/85">
-                        <div class="border border-white/15 rounded-2xl bg-white/10 px-4 py-3 backdrop-blur-md">
+                      <div class="settings-preview-form-grid grid grid-cols-2 gap-3 text-center text-xs">
+                        <div class="settings-preview-form-chip rounded-2xl px-4 py-3">
                           自动化
                         </div>
-                        <div class="border border-white/15 rounded-2xl bg-white/10 px-4 py-3 backdrop-blur-md">
+                        <div class="settings-preview-form-chip rounded-2xl px-4 py-3">
                           多账号
                         </div>
                       </div>
@@ -4675,7 +4964,7 @@ async function restoreTimingDefaults() {
 
             <div
               v-if="loginPreviewLoadFailed"
-              class="absolute bottom-5 left-5 right-5 z-20 border border-rose-200/40 rounded-2xl bg-rose-500/20 px-4 py-3 text-sm text-white backdrop-blur-xl"
+              class="settings-preview-fail absolute bottom-5 left-5 right-5 z-20 rounded-2xl px-4 py-3 text-sm"
             >
               当前图片链接无法直接加载，预览已自动回退为默认渐变背景。正式保存前建议先换成可直链图片。
             </div>
@@ -4685,21 +4974,21 @@ async function restoreTimingDefaults() {
 
       <div v-if="reportDetailVisible && reportDetailItem" class="fixed inset-0 z-50 flex items-center justify-center p-4">
         <div
-          class="absolute inset-0 bg-gray-900/45 backdrop-blur-sm dark:bg-black/70"
+          class="settings-report-detail-overlay absolute inset-0 backdrop-blur-sm"
           @click="closeReportLogDetail"
         />
-        <div class="glass-panel relative z-10 max-h-[85vh] max-w-3xl w-full overflow-hidden border border-white/20 rounded-2xl shadow-2xl dark:border-white/10">
-          <div class="flex items-center justify-between border-b border-gray-200/50 px-6 py-4 dark:border-white/10">
+        <div class="settings-report-detail-modal glass-panel relative z-10 max-h-[85vh] max-w-3xl w-full overflow-hidden border rounded-2xl shadow-2xl">
+          <div class="settings-report-detail-header flex items-center justify-between px-6 py-4">
             <div class="min-w-0">
-              <h3 class="truncate text-base text-gray-900 font-bold dark:text-gray-100">
+              <h3 class="settings-report-detail-title truncate text-base font-bold">
                 {{ reportDetailItem.title || '经营汇报详情' }}
               </h3>
-              <div class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              <div class="settings-report-detail-meta mt-1 text-xs">
                 {{ formatReportMode(reportDetailItem.mode) }} · {{ formatReportLogTime(reportDetailItem.createdAt) }} · {{ reportDetailItem.channel || 'unknown' }}
               </div>
             </div>
             <button
-              class="rounded-full p-2 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-700 dark:hover:text-gray-300"
+              class="settings-report-detail-close rounded-full p-2 transition-colors"
               @click="closeReportLogDetail"
             >
               <div class="i-carbon-close text-xl" />
@@ -4709,34 +4998,34 @@ async function restoreTimingDefaults() {
           <div class="max-h-[calc(85vh-8rem)] overflow-auto px-6 py-5 space-y-4">
             <div class="flex flex-wrap items-center gap-2">
               <span
-                class="rounded-full px-2.5 py-1 text-[11px] font-bold"
-                :class="reportDetailItem.ok ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'"
+                class="settings-result-badge rounded-full px-2.5 py-1 text-[11px] font-bold"
+                :class="reportDetailItem.ok ? 'settings-result-badge-success' : 'settings-result-badge-danger'"
               >
                 {{ reportDetailItem.ok ? '发送成功' : '发送失败' }}
               </span>
-              <span class="rounded-full bg-gray-100 px-2.5 py-1 text-[11px] text-gray-600 dark:bg-white/10 dark:text-gray-300">
+              <span class="settings-report-detail-chip rounded-full px-2.5 py-1 text-[11px]">
                 账号：{{ reportDetailItem.accountName || reportDetailItem.accountId || '-' }}
               </span>
-              <span class="rounded-full bg-gray-100 px-2.5 py-1 text-[11px] text-gray-600 dark:bg-white/10 dark:text-gray-300">
+              <span class="settings-report-detail-chip rounded-full px-2.5 py-1 text-[11px]">
                 ID：{{ reportDetailItem.accountId || '-' }}
               </span>
             </div>
 
-            <div v-if="reportDetailItem.errorMessage" class="border border-red-200/70 rounded-xl bg-red-50/70 px-4 py-3 text-sm text-red-700 dark:border-red-900/40 dark:bg-red-950/20 dark:text-red-300">
+            <div v-if="reportDetailItem.errorMessage" class="settings-health-alert rounded-xl px-4 py-3 text-sm">
               失败原因：{{ reportDetailItem.errorMessage }}
             </div>
 
-            <div class="border border-emerald-200/60 rounded-xl bg-black/5 px-4 py-4 dark:border-emerald-800/30 dark:bg-white/5">
-              <div class="mb-2 text-xs text-gray-500 font-bold tracking-widest uppercase dark:text-gray-400">
+            <div class="settings-report-detail-body rounded-xl px-4 py-4">
+              <div class="settings-report-detail-body-label mb-2 text-xs font-bold tracking-widest uppercase">
                 完整正文
               </div>
-              <div class="whitespace-pre-line break-words text-sm text-gray-800 leading-6 dark:text-gray-200">
+              <div class="settings-report-detail-body-content whitespace-pre-line break-words text-sm leading-6">
                 {{ reportDetailItem.content || '无正文' }}
               </div>
             </div>
           </div>
 
-          <div class="flex justify-end border-t border-gray-200/50 px-6 py-4 dark:border-white/10">
+          <div class="settings-report-detail-footer flex justify-end px-6 py-4">
             <BaseButton
               variant="secondary"
               size="sm"
@@ -4793,5 +5082,690 @@ async function restoreTimingDefaults() {
 </template>
 
 <style scoped lang="postcss">
-/* Custom styles if needed */
+.settings-page {
+  color: var(--ui-text-1);
+}
+
+.settings-page :is(.text-gray-500, .text-gray-400, .glass-text-muted) {
+  color: var(--ui-text-2) !important;
+}
+
+.settings-page [class*='text-white/90'],
+.settings-page [class*='text-white/80'],
+.settings-page [class*='text-white/70'] {
+  color: color-mix(in srgb, var(--ui-text-on-brand) 90%, var(--ui-text-1) 10%) !important;
+}
+
+.settings-page [class*='border-gray-100'],
+.settings-page [class*='border-gray-200/'],
+.settings-page [class*='dark:border-gray-700'],
+.settings-page [class*='border-white/10'],
+.settings-page [class*='border-white/20'] {
+  border-color: var(--ui-border-subtle) !important;
+}
+
+.settings-page [class*='bg-black/5'],
+.settings-page [class*='bg-black/25'],
+.settings-page [class*='bg-white/5'],
+.settings-page [class*='bg-white/10'],
+.settings-page [class*='bg-white/80'],
+.settings-page [class*='dark:bg-gray-900/40'] {
+  background-color: color-mix(in srgb, var(--ui-bg-surface) 64%, transparent) !important;
+}
+
+/* 5 套主题联动卡片：统一封面/正文高度与按钮尺寸，避免“有大有小” */
+.settings-theme-bundle-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 28rem;
+}
+
+.settings-theme-bundle-cover {
+  flex: 0 0 7.25rem;
+}
+
+.settings-theme-bundle-body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+
+.settings-theme-bundle-head {
+  align-items: flex-start;
+  min-height: 2.35rem;
+}
+
+.settings-theme-bundle-title {
+  display: -webkit-box;
+  min-height: 2.4rem;
+  overflow: hidden;
+  line-height: 1.2rem;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.settings-theme-bundle-action {
+  align-self: flex-start;
+  flex: 0 0 auto;
+  line-height: 1rem;
+  min-width: 4.4rem;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.settings-theme-bundle-badge {
+  white-space: nowrap;
+}
+
+.settings-theme-bundle-desc {
+  min-height: 3.8rem;
+}
+
+.settings-theme-bundle-metrics {
+  margin-top: auto;
+}
+
+.settings-preset-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--ui-border-subtle);
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease;
+}
+
+.settings-preset-chip-brand {
+  background: var(--ui-brand-soft-10);
+  border-color: color-mix(in srgb, var(--ui-brand-500) 26%, var(--ui-border-subtle));
+  color: var(--ui-brand-700);
+}
+
+.settings-preset-chip-info {
+  background: color-mix(in srgb, var(--ui-status-info) 10%, transparent);
+  border-color: color-mix(in srgb, var(--ui-status-info) 24%, var(--ui-border-subtle));
+  color: var(--ui-status-info);
+}
+
+.settings-preset-chip-warning {
+  background: color-mix(in srgb, var(--ui-status-warning) 10%, transparent);
+  border-color: color-mix(in srgb, var(--ui-status-warning) 24%, var(--ui-border-subtle));
+  color: var(--ui-status-warning);
+}
+
+.settings-toolbar-divider {
+  background: color-mix(in srgb, var(--ui-border-strong) 72%, transparent);
+}
+
+.settings-mode-panel,
+.settings-mode-state-card,
+.settings-mode-card,
+.settings-trade-textarea,
+.settings-automation-card,
+.settings-friend-panel,
+.settings-preview-trigger,
+.settings-preview-card,
+.settings-preview-modal {
+  border: 1px solid var(--ui-border-subtle);
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 84%, transparent);
+}
+
+.settings-mode-banner {
+  border: 1px solid var(--ui-border-subtle);
+}
+
+.settings-mode-banner-info {
+  border-color: color-mix(in srgb, var(--ui-status-info) 24%, var(--ui-border-subtle));
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--ui-status-info) 10%, var(--ui-bg-surface-raised)),
+    color-mix(in srgb, var(--ui-brand-100) 18%, var(--ui-bg-surface))
+  );
+}
+
+.settings-mode-banner-warning {
+  border-color: color-mix(in srgb, var(--ui-status-warning) 24%, var(--ui-border-subtle));
+  background: color-mix(in srgb, var(--ui-status-warning) 10%, var(--ui-bg-surface-raised));
+}
+
+.settings-mode-banner-success {
+  border-color: color-mix(in srgb, var(--ui-status-success) 24%, var(--ui-border-subtle));
+  background: color-mix(in srgb, var(--ui-status-success) 10%, var(--ui-bg-surface-raised));
+}
+
+.settings-mode-banner-title,
+.settings-mode-state-title {
+  color: var(--ui-text-1);
+}
+
+.settings-mode-banner-info .settings-mode-banner-title,
+.settings-mode-note-info {
+  color: var(--ui-status-info);
+}
+
+.settings-mode-banner-warning .settings-mode-banner-title,
+.settings-mode-note-warning {
+  color: var(--ui-status-warning);
+}
+
+.settings-mode-banner-success .settings-mode-banner-title {
+  color: var(--ui-status-success);
+}
+
+.settings-mode-banner-copy,
+.settings-mode-state-copy,
+.settings-mode-card-copy,
+.settings-mode-note-muted,
+.settings-inventory-copy {
+  color: var(--ui-text-2);
+}
+
+.settings-mode-card {
+  border-color: var(--ui-border-subtle);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 18%, transparent);
+}
+
+.settings-mode-card-title,
+.settings-mode-card-check {
+  color: inherit;
+}
+
+.settings-mode-card-brand {
+  color: var(--ui-brand-700);
+}
+
+.settings-mode-card-warning {
+  color: var(--ui-status-warning);
+}
+
+.settings-mode-card-success {
+  color: var(--ui-status-success);
+}
+
+.settings-mode-card-active {
+  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 35%, transparent);
+  background: color-mix(in srgb, currentColor 10%, var(--ui-bg-surface-raised));
+  border-color: color-mix(in srgb, currentColor 30%, var(--ui-border-subtle));
+}
+
+.settings-mode-inline-action {
+  border-color: color-mix(in srgb, var(--ui-status-success) 24%, var(--ui-border-subtle));
+  color: var(--ui-status-success);
+}
+
+.settings-risk-alert {
+  border: 1px solid color-mix(in srgb, var(--ui-status-danger) 24%, var(--ui-border-subtle));
+  background: color-mix(in srgb, var(--ui-status-danger) 10%, var(--ui-bg-surface-raised));
+  color: var(--ui-status-danger);
+}
+
+.settings-mode-badge,
+.settings-health-pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.25rem 0.625rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.settings-mode-badge-brand {
+  background: var(--ui-brand-soft-12);
+  color: var(--ui-brand-700);
+}
+
+.settings-mode-badge-success,
+.settings-health-pill-success {
+  background: color-mix(in srgb, var(--ui-status-success) 12%, transparent);
+  color: var(--ui-status-success);
+}
+
+.settings-mode-badge-warning,
+.settings-health-pill-warning {
+  background: color-mix(in srgb, var(--ui-status-warning) 12%, transparent);
+  color: var(--ui-status-warning);
+}
+
+.settings-mode-badge-info {
+  background: color-mix(in srgb, var(--ui-status-info) 12%, transparent);
+  color: var(--ui-status-info);
+}
+
+.settings-mode-badge-neutral,
+.settings-health-pill-neutral {
+  background: color-mix(in srgb, var(--ui-bg-surface) 84%, transparent);
+  color: var(--ui-text-2);
+  border-color: var(--ui-border-subtle);
+}
+
+.settings-strategy-preview {
+  border: 1px solid var(--ui-border-subtle);
+  background: color-mix(in srgb, var(--ui-status-info) 8%, var(--ui-bg-surface-raised));
+  color: var(--ui-status-info);
+}
+
+.settings-inventory-panel {
+  border: 1px solid color-mix(in srgb, #0f766e 22%, var(--ui-border-subtle));
+  background: color-mix(in srgb, #0f766e 8%, var(--ui-bg-surface-raised));
+}
+
+.settings-inventory-title {
+  color: color-mix(in srgb, #0f766e 84%, var(--ui-text-1));
+}
+
+.settings-inventory-action {
+  border-color: color-mix(in srgb, #0f766e 24%, var(--ui-border-subtle));
+  color: color-mix(in srgb, #0f766e 84%, var(--ui-text-1));
+}
+
+.settings-inventory-rule {
+  border: 1px solid color-mix(in srgb, #0f766e 20%, var(--ui-border-subtle));
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 88%, transparent);
+}
+
+.settings-inventory-remove {
+  color: var(--ui-status-danger);
+}
+
+.settings-inventory-remove:hover {
+  background: color-mix(in srgb, var(--ui-status-danger) 10%, transparent);
+}
+
+.settings-inventory-empty {
+  border: 1px dashed color-mix(in srgb, #0f766e 24%, var(--ui-border-subtle));
+  color: color-mix(in srgb, #0f766e 72%, var(--ui-text-2));
+}
+
+.settings-trade-textarea {
+  color: var(--ui-text-1);
+}
+
+.settings-trade-textarea::placeholder {
+  color: var(--ui-text-2);
+}
+
+.settings-automation-card {
+  border: 1px solid var(--ui-border-subtle);
+  background: color-mix(in srgb, var(--ui-bg-surface) 74%, transparent);
+}
+
+.settings-automation-card:hover {
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 86%, transparent);
+}
+
+.settings-automation-note {
+  color: var(--ui-text-2);
+}
+
+.settings-automation-scope {
+  background: color-mix(in srgb, var(--ui-status-success) 10%, var(--ui-bg-surface-raised));
+  color: var(--ui-status-success);
+}
+
+.settings-friend-panel {
+  overflow: hidden;
+}
+
+.settings-friend-panel-active {
+  border-color: color-mix(in srgb, var(--ui-status-info) 20%, var(--ui-border-subtle));
+  background: color-mix(in srgb, var(--ui-status-info) 7%, var(--ui-bg-surface-raised));
+}
+
+.settings-friend-panel-inactive {
+  border-color: var(--ui-border-subtle);
+  background: color-mix(in srgb, var(--ui-bg-surface) 72%, transparent);
+}
+
+.settings-friend-overlay {
+  background: color-mix(in srgb, var(--ui-overlay-backdrop) 72%, transparent);
+}
+
+.settings-friend-overlay-badge {
+  border: 1px solid var(--ui-border-subtle);
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 76%, var(--ui-overlay-backdrop));
+  color: var(--ui-text-1);
+}
+
+.settings-friend-title-active {
+  color: var(--ui-status-info);
+}
+
+.settings-friend-title-inactive {
+  color: var(--ui-text-3);
+}
+
+.settings-stakeout-delay {
+  border: 1px solid var(--ui-border-subtle);
+  background: color-mix(in srgb, var(--ui-bg-surface) 72%, transparent);
+}
+
+.settings-preview-trigger {
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 72%, transparent);
+}
+
+.settings-preview-trigger:hover,
+.settings-preview-close:hover {
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 88%, transparent);
+}
+
+.settings-preview-card,
+.settings-preview-modal {
+  border-color: color-mix(in srgb, white 18%, var(--ui-border-subtle));
+}
+
+.settings-preview-glass,
+.settings-preview-sidebar,
+.settings-preview-panel,
+.settings-preview-brand-panel,
+.settings-preview-brand-card,
+.settings-preview-form-panel,
+.settings-preview-input,
+.settings-preview-form-chip,
+.settings-preview-close,
+.settings-preview-chip {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.16);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.settings-preview-chip,
+.settings-preview-brand-panel,
+.settings-preview-form-header,
+.settings-preview-form-copy,
+.settings-preview-form-grid {
+  color: color-mix(in srgb, var(--ui-text-on-brand) 94%, var(--ui-text-1) 6%);
+}
+
+.settings-preview-sidebar,
+.settings-preview-panel,
+.settings-preview-input,
+.settings-preview-form-chip {
+  background: rgba(255, 255, 255, 0.13);
+}
+
+.settings-preview-overlay {
+  background: color-mix(in srgb, var(--ui-overlay-backdrop) 90%, transparent);
+}
+
+.settings-preview-close {
+  color: var(--ui-text-on-brand);
+}
+
+.settings-preview-brand-panel {
+  color: var(--ui-text-on-brand);
+}
+
+.settings-preview-brand-icon,
+.settings-preview-form-icon {
+  background: rgba(255, 255, 255, 0.84);
+  color: var(--ui-brand-600);
+}
+
+.settings-preview-brand-copy {
+  color: color-mix(in srgb, var(--ui-text-on-brand) 88%, var(--ui-text-1) 12%);
+}
+
+.settings-preview-form-panel {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.dark .settings-preview-form-panel,
+.dark .settings-preview-glass,
+.dark .settings-preview-sidebar,
+.dark .settings-preview-panel,
+.dark .settings-preview-input,
+.dark .settings-preview-form-chip,
+.dark .settings-preview-close,
+.dark .settings-preview-chip {
+  background: rgba(2, 6, 23, 0.26);
+}
+
+.settings-preview-input {
+  color: color-mix(in srgb, var(--ui-text-on-brand) 96%, var(--ui-text-1) 4%);
+}
+
+.settings-preview-submit {
+  background: rgba(255, 255, 255, 0.88);
+  color: #1f2937;
+}
+
+.settings-preview-fail {
+  border: 1px solid color-mix(in srgb, #fb7185 28%, rgba(255, 255, 255, 0.22));
+  background: color-mix(in srgb, #be123c 24%, rgba(15, 23, 42, 0.5));
+  color: var(--ui-text-on-brand);
+  backdrop-filter: blur(18px);
+}
+
+.settings-inline-unit,
+.settings-report-meta,
+.settings-report-stat-label,
+.settings-report-stat-hint,
+.settings-report-selection,
+.settings-report-log-meta,
+.settings-report-state-note,
+.settings-health-note,
+.settings-health-card-label,
+.settings-health-card-note,
+.settings-report-detail-meta,
+.settings-report-detail-body-label {
+  color: var(--ui-text-2);
+}
+
+.settings-section-divider,
+.settings-report-detail-header,
+.settings-report-detail-footer {
+  border-color: var(--ui-border-subtle);
+}
+
+.settings-report-panel,
+.settings-report-stat-card,
+.settings-report-log-card,
+.settings-health-card,
+.settings-report-detail-body {
+  border: 1px solid var(--ui-border-subtle);
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 84%, transparent);
+}
+
+.settings-report-panel-success {
+  border-color: color-mix(in srgb, var(--ui-status-success) 24%, var(--ui-border-subtle) 76%);
+  background: color-mix(in srgb, var(--ui-status-success-soft) 72%, var(--ui-bg-surface-raised));
+}
+
+.settings-report-panel-title,
+.settings-report-active {
+  color: var(--ui-status-success);
+}
+
+.settings-report-divider {
+  border-top: 1px solid color-mix(in srgb, var(--ui-status-success) 18%, var(--ui-border-subtle));
+}
+
+.settings-info-banner {
+  border: 1px solid color-mix(in srgb, var(--ui-status-info) 28%, var(--ui-border-subtle) 72%);
+  background: color-mix(in srgb, var(--ui-status-info-soft) 72%, var(--ui-bg-surface-raised));
+  color: var(--ui-status-info);
+}
+
+.settings-report-stat-card {
+  border-color: color-mix(in srgb, var(--ui-status-success) 20%, var(--ui-border-subtle) 80%);
+}
+
+.settings-report-stat-card-active {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ui-status-success) 42%, transparent);
+}
+
+.settings-report-card-bg-neutral {
+  background: color-mix(in srgb, var(--ui-bg-surface) 88%, transparent);
+}
+
+.settings-report-card-bg-success {
+  background: color-mix(in srgb, var(--ui-status-success) 10%, var(--ui-bg-surface-raised));
+}
+
+.settings-report-card-bg-danger {
+  background: color-mix(in srgb, var(--ui-status-danger) 10%, var(--ui-bg-surface-raised));
+}
+
+.settings-report-card-bg-info {
+  background: color-mix(in srgb, var(--ui-status-info) 10%, var(--ui-bg-surface-raised));
+}
+
+.settings-report-card-bg-warning {
+  background: color-mix(in srgb, var(--ui-status-warning) 11%, var(--ui-bg-surface-raised));
+}
+
+.settings-report-card-bg-accent {
+  background: color-mix(in srgb, #7c3aed 10%, var(--ui-bg-surface-raised));
+}
+
+.settings-report-card-tone-main,
+.settings-health-card-value,
+.settings-report-log-title,
+.settings-report-log-body,
+.settings-report-detail-title,
+.settings-report-detail-body-content {
+  color: var(--ui-text-1);
+}
+
+.settings-report-card-tone-success {
+  color: var(--ui-status-success);
+}
+
+.settings-report-card-tone-danger,
+.settings-report-error {
+  color: var(--ui-status-danger);
+}
+
+.settings-report-card-tone-info {
+  color: var(--ui-status-info);
+}
+
+.settings-report-card-tone-warning {
+  color: var(--ui-status-warning);
+}
+
+.settings-report-card-tone-accent {
+  color: color-mix(in srgb, #7c3aed 82%, var(--ui-text-1));
+}
+
+.settings-report-checkbox {
+  accent-color: var(--ui-brand-500);
+  border-color: var(--ui-border-strong);
+}
+
+.settings-report-empty {
+  border: 1px dashed color-mix(in srgb, var(--ui-status-success) 26%, var(--ui-border-subtle));
+  background: color-mix(in srgb, var(--ui-bg-surface) 76%, transparent);
+  color: var(--ui-text-2);
+}
+
+.settings-report-log-card {
+  border-color: color-mix(in srgb, var(--ui-status-success) 20%, var(--ui-border-subtle) 80%);
+}
+
+.settings-result-badge {
+  border: 1px solid transparent;
+}
+
+.settings-result-badge-success {
+  background: color-mix(in srgb, var(--ui-status-success) 12%, transparent);
+  color: var(--ui-status-success);
+}
+
+.settings-result-badge-danger {
+  background: color-mix(in srgb, var(--ui-status-danger) 12%, transparent);
+  color: var(--ui-status-danger);
+}
+
+.settings-report-log-body,
+.settings-report-detail-body {
+  background: color-mix(in srgb, var(--ui-bg-surface) 76%, transparent);
+}
+
+.settings-health-card {
+  background: color-mix(in srgb, var(--ui-bg-surface) 78%, transparent);
+}
+
+.settings-health-alert {
+  border: 1px solid color-mix(in srgb, var(--ui-status-danger) 26%, var(--ui-border-subtle));
+  background: color-mix(in srgb, var(--ui-status-danger) 9%, var(--ui-bg-surface-raised));
+  color: var(--ui-status-danger);
+}
+
+.settings-health-primary-card {
+  border: 1px solid color-mix(in srgb, var(--ui-brand-500) 24%, var(--ui-border-subtle) 76%);
+  background: color-mix(in srgb, var(--ui-brand-500) 8%, var(--ui-bg-surface-raised));
+}
+
+.settings-health-primary-label,
+.settings-health-primary-note {
+  color: color-mix(in srgb, var(--ui-brand-700) 88%, var(--ui-text-2));
+}
+
+.settings-health-primary-code {
+  color: color-mix(in srgb, var(--ui-brand-700) 92%, var(--ui-text-1));
+}
+
+.settings-health-status-card {
+  border: 1px solid var(--ui-border-subtle);
+}
+
+.settings-health-status-card-success {
+  border-color: color-mix(in srgb, var(--ui-status-success) 24%, var(--ui-border-subtle) 76%);
+  background: color-mix(in srgb, var(--ui-status-success) 9%, var(--ui-bg-surface-raised));
+  color: var(--ui-status-success);
+}
+
+.settings-health-status-card-warning {
+  border-color: color-mix(in srgb, var(--ui-status-warning) 24%, var(--ui-border-subtle) 76%);
+  background: color-mix(in srgb, var(--ui-status-warning) 9%, var(--ui-bg-surface-raised));
+  color: var(--ui-status-warning);
+}
+
+.settings-health-status-card-info {
+  border-color: color-mix(in srgb, var(--ui-status-info) 24%, var(--ui-border-subtle) 76%);
+  background: color-mix(in srgb, var(--ui-status-info) 9%, var(--ui-bg-surface-raised));
+  color: var(--ui-status-info);
+}
+
+.settings-health-status-card-neutral {
+  border-color: var(--ui-border-subtle);
+  background: color-mix(in srgb, var(--ui-bg-surface) 82%, transparent);
+  color: var(--ui-text-2);
+}
+
+.settings-health-status-value {
+  color: inherit;
+}
+
+.settings-report-detail-overlay {
+  background: color-mix(in srgb, var(--ui-overlay-backdrop) 88%, transparent);
+}
+
+.settings-report-detail-modal {
+  border-color: var(--ui-border-subtle);
+  background: color-mix(in srgb, var(--ui-bg-surface-raised) 90%, transparent);
+}
+
+.settings-report-detail-close {
+  color: var(--ui-text-2);
+}
+
+.settings-report-detail-close:hover {
+  background: color-mix(in srgb, var(--ui-bg-surface) 78%, transparent);
+  color: var(--ui-text-1);
+}
+
+.settings-report-detail-chip {
+  border: 1px solid var(--ui-border-subtle);
+  background: color-mix(in srgb, var(--ui-bg-surface) 82%, transparent);
+  color: var(--ui-text-2);
+}
 </style>

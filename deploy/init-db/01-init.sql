@@ -205,16 +205,59 @@ CREATE TABLE IF NOT EXISTS `operation_logs` (
     CONSTRAINT `operation_logs_ibfk_1` FOREIGN KEY (`account_id`) REFERENCES `accounts` (`id`) ON DELETE CASCADE
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `account_bag_preferences` (
+    `id` INT NOT NULL AUTO_INCREMENT,
+    `account_id` INT NOT NULL,
+    `purchase_memory` JSON DEFAULT NULL,
+    `activity_history` JSON DEFAULT NULL,
+    `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_account_bag_preferences_account_id` (`account_id`),
+    CONSTRAINT `account_bag_preferences_ibfk_1` FOREIGN KEY (`account_id`) REFERENCES `accounts` (`id`) ON DELETE CASCADE
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS `ui_settings` (
     `id` INT NOT NULL AUTO_INCREMENT,
     `user_id` INT NOT NULL,
     `theme` VARCHAR(50) COLLATE utf8mb4_unicode_ci DEFAULT 'dark',
-    `performance_mode` TINYINT(1) DEFAULT '0',
+    `performance_mode` TINYINT(1) DEFAULT '1',
+    `login_background` VARCHAR(2048) COLLATE utf8mb4_unicode_ci DEFAULT '',
+    `background_scope` VARCHAR(32) COLLATE utf8mb4_unicode_ci DEFAULT 'login_only',
+    `login_background_overlay_opacity` INT DEFAULT '30',
+    `login_background_blur` INT DEFAULT '2',
+    `workspace_visual_preset` VARCHAR(32) COLLATE utf8mb4_unicode_ci DEFAULT 'console',
+    `app_background_overlay_opacity` INT DEFAULT '54',
+    `app_background_blur` INT DEFAULT '8',
+    `color_theme` VARCHAR(64) COLLATE utf8mb4_unicode_ci DEFAULT 'default',
+    `theme_background_linked` TINYINT(1) DEFAULT '0',
+    `ui_timestamp` BIGINT DEFAULT '0',
     `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
     `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
-    KEY `user_id` (`user_id`),
+    UNIQUE KEY `uk_ui_settings_user_id` (`user_id`),
     CONSTRAINT `ui_settings_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `user_preferences` (
+    `id` INT NOT NULL AUTO_INCREMENT,
+    `user_id` INT NOT NULL,
+    `current_account_id` VARCHAR(128) COLLATE utf8mb4_unicode_ci DEFAULT '',
+    `announcement_dismissed_id` VARCHAR(32) COLLATE utf8mb4_unicode_ci DEFAULT '',
+    `notification_last_read_date` VARCHAR(32) COLLATE utf8mb4_unicode_ci DEFAULT '',
+    `app_seen_version` VARCHAR(64) COLLATE utf8mb4_unicode_ci DEFAULT '',
+    `accounts_view_state` JSON DEFAULT NULL,
+    `accounts_action_history` JSON DEFAULT NULL,
+    `dashboard_view_state` JSON DEFAULT NULL,
+    `analytics_view_state` JSON DEFAULT NULL,
+    `report_history_view_state` JSON DEFAULT NULL,
+    `cards_view_state` JSON DEFAULT NULL,
+    `system_logs_view_state` JSON DEFAULT NULL,
+    `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_user_preferences_user_id` (`user_id`),
+    CONSTRAINT `user_preferences_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `system_logs` (
@@ -263,6 +306,14 @@ CREATE TABLE IF NOT EXISTS `stats_daily` (
     `total_help` INT DEFAULT 0,
     `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY `uk_date` (`record_date`)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `system_settings` (
+    `setting_key` VARCHAR(100) COLLATE utf8mb4_unicode_ci NOT NULL,
+    `setting_value` JSON NOT NULL,
+    `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`setting_key`)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `report_logs` (

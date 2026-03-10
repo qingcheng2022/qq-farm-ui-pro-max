@@ -1,9 +1,10 @@
 /* eslint-disable no-alert, unused-imports/no-unused-vars */
 
 <script setup lang="ts">
+import type { DashboardViewState } from '@/utils/view-preferences'
 import { useIntervalFn, useStorage } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import api from '@/api'
 import ConfirmModal from '@/components/ConfirmModal.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
@@ -14,6 +15,8 @@ import { useAccountStore } from '@/stores/account'
 import { useBagStore } from '@/stores/bag'
 import { useSettingStore } from '@/stores/setting'
 import { useStatusStore } from '@/stores/status'
+import { localizeRuntimeText } from '@/utils/runtime-text'
+import { DEFAULT_DASHBOARD_VIEW_STATE, fetchViewPreferences, normalizeDashboardViewState, saveViewPreferences } from '@/utils/view-preferences'
 
 const statusStore = useStatusStore()
 const accountStore = useAccountStore()
@@ -44,16 +47,18 @@ const allLogs = computed(() => {
   return statusLogs.value || []
 })
 
-const filter = useStorage('dashboard_log_filter', {
-  module: '',
-  event: '',
-  keyword: '',
-  isWarn: '',
+const filter = useStorage<DashboardViewState>('dashboard_log_filter', {
+  ...DEFAULT_DASHBOARD_VIEW_STATE,
 })
+const DASHBOARD_BROWSER_PREF_NOTE = '日志筛选条件会跟随当前登录用户同步到服务器；本机缓存只作首屏兜底。日志内容本身仍然实时来自当前账号。'
+let dashboardViewSyncTimer: ReturnType<typeof setTimeout> | null = null
+let dashboardViewHydrating = false
+let dashboardViewSyncEnabled = false
 
 const hasActiveLogFilter = computed(() =>
   !!(filter.value.module || filter.value.event || filter.value.keyword || filter.value.isWarn),
 )
+const dashboardViewSignature = computed(() => JSON.stringify(buildDashboardViewState()))
 
 const modules = [
   { label: '所有模块', value: '' },
@@ -539,10 +544,16 @@ const TASK_GROUP: Record<string, string> = {
   'illustrated_rewards': '📅 每日',
   'email_rewards': '📅 每日',
   'mall_free_gifts': '📅 每日',
+  'scan-account-reports': '📊 汇报',
   'task_scan': '📅 每日',
   'task_claim_debounce': '📅 每日',
   'task_init_bootstrap': '📅 每日',
   'unified_next_tick': '⏱ 系统',
+  'daily_routine_immediate': '📅 每日',
+  'ws_error_cleanup': '⏱ 系统',
+  'kickout_stop': '⏱ 系统',
+  'auto_reconnect': '⏱ 系统',
+  'login_error_exit': '⏱ 系统',
   'status_sync': '⏱ 系统',
   'heartbeat_interval': '⏱ 系统',
   'daily-stats-job': '⏱ 系统',
@@ -553,10 +564,16 @@ function getTaskGroup(name: string): string {
   if (TASK_GROUP[name])
     return TASK_GROUP[name]
   // 动态匹配
+  if (name.startsWith('daily_routine_'))
+    return '📅 每日'
   if (name.startsWith('anti_steal_land_'))
     return '🛡 防偷'
-  if (name.startsWith('stakeout_steal_'))
+  if (name.startsWith('stakeout_steal_') || name.startsWith('stake_'))
     return '🔍 蹲守'
+  if (name.startsWith('restart_broadcast_retry_'))
+    return '📊 汇报'
+  if (name.startsWith('force_kill_') || name.startsWith('restart_fallback_'))
+    return '⏱ 系统'
   if (name.startsWith('api_timeout_') || name.startsWith('request_timeout_'))
     return '🌐 网络监控'
 
@@ -724,10 +741,10 @@ const TASK_META: Record<string, TaskMeta> = {
     ],
   },
   'task_scan': {
-    label: '✅ 每日任务',
+    label: '✅ 任务扫描',
     steps: [
-      '扫描可完成的每日任务',
-      '自动完成任务条件',
+      '扫描每日任务和成长任务',
+      '识别已达成的领奖条件',
       '领取任务奖励',
     ],
   },
@@ -742,7 +759,7 @@ const TASK_META: Record<string, TaskMeta> = {
     label: '🔄 任务初始化',
     steps: [
       '初始化任务系统',
-      '加载每日任务列表',
+      '加载任务列表',
     ],
   },
   'unified_next_tick': {
@@ -754,14 +771,50 @@ const TASK_META: Record<string, TaskMeta> = {
       '计算下次调度时间',
     ],
   },
+  'daily_routine_immediate': {
+    label: '📅 日常任务(快速)',
+    steps: [
+      '快速触发跨日礼包检查',
+      '立即补跑日常奖励领取链路',
+    ],
+  },
+  'auto_reconnect': {
+    label: '🔄 自动重连',
+    steps: [
+      '等待重连窗口到达',
+      '尝试重新建立连接',
+      '恢复后续调度链路',
+    ],
+  },
+  'login_error_exit': {
+    label: '⛔ 登录失败退出',
+    steps: [
+      '等待登录失败缓冲期',
+      '安全停止当前账号进程',
+    ],
+  },
+  'ws_error_cleanup': {
+    label: '🔧 连接错误清理',
+    steps: [
+      '记录最近一次连接异常',
+      '清理异常状态并释放残留资源',
+    ],
+  },
+  'kickout_stop': {
+    label: '🔌 被踢下线处理',
+    steps: [
+      '记录被踢下线状态',
+      '停止当前账号任务链路',
+    ],
+  },
   'daily_routine_interval': {
     label: '📅 跨日礼包检测',
     steps: [
-      '检测是否跨日',
-      '触发邮箱奖励领取',
-      '触发分享奖励领取',
-      '触发月卡/会员/开服礼包领取',
-      '触发免费礼包领取',
+      '等待下一次跨日',
+      '跨日后触发邮箱奖励领取',
+      '跨日后触发分享奖励领取',
+      '跨日后触发月卡/会员/开服礼包领取',
+      '跨日后触发免费礼包领取',
     ],
   },
   'status_sync': {
@@ -786,6 +839,16 @@ const TASK_META: Record<string, TaskMeta> = {
       '清理超期日志记录',
     ],
   },
+  'scan-account-reports': {
+    label: '📊 经营汇报扫描',
+    steps: [
+      '扫描已启用经营汇报的账号',
+      '检查小时汇报是否到点',
+      '检查日报是否到点',
+      '触发到期汇报发送',
+      '清理过期汇报历史',
+    ],
+  },
   'heartbeat_interval': {
     label: '💓 心跳保活',
     steps: [
@@ -804,7 +867,7 @@ function getTaskDisplayName(name: string) {
   if (antiStealMatch)
     return `🛡 防偷抢收 #${antiStealMatch[1]}`
   // 动态任务名匹配：蹲守偷菜 (stakeout_steal_friend_123 → 🔍 蹲守偷菜)
-  if (name.startsWith('stakeout_steal_'))
+  if (name.startsWith('stakeout_steal_') || name.startsWith('stake_'))
     return '🔍 蹲守偷菜'
   // 日常防抖立即执行
   if (name === 'daily_routine_immediate')
@@ -815,6 +878,16 @@ function getTaskDisplayName(name: string) {
   // 踢下线停止
   if (name === 'kickout_stop')
     return '🔌 被踢下线处理'
+  if (name === 'auto_reconnect')
+    return '🔄 自动重连'
+  if (name === 'login_error_exit')
+    return '⛔ 登录失败退出'
+  if (name.startsWith('restart_broadcast_retry_'))
+    return '📣 重启提醒重试'
+  if (name.startsWith('force_kill_'))
+    return '🛑 强制结束进程'
+  if (name.startsWith('restart_fallback_'))
+    return '♻️ 重启兜底'
 
   // 频繁接口访问超时保护控制
   const apiTimeoutMatch = name.match(/^api_timeout_(.*)$/)
@@ -829,10 +902,48 @@ function getTaskDisplayName(name: string) {
     if (name.includes(key))
       return meta.label
   }
-  return name
+  return localizeRuntimeText(name)
 }
 
 function getTaskSteps(name: string): string[] {
+  if (name.startsWith('restart_broadcast_retry_')) {
+    return [
+      '等待下一次重试时间',
+      '重新发送服务器重启提醒',
+      '记录本次发送结果',
+    ]
+  }
+  if (name.startsWith('force_kill_')) {
+    return [
+      '等待优雅停止超时',
+      '强制终止异常账号进程',
+    ]
+  }
+  if (name.startsWith('restart_fallback_')) {
+    return [
+      '等待重启兜底窗口',
+      '确认账号是否需要再次拉起',
+    ]
+  }
+  if (name.startsWith('api_timeout_')) {
+    return [
+      '等待子进程接口调用超时',
+      '回收未完成请求并返回超时结果',
+    ]
+  }
+  if (name.startsWith('request_timeout_')) {
+    return [
+      '等待网络请求超时阈值',
+      '终止当前请求并释放占用回调',
+    ]
+  }
+  if (name.startsWith('stake_') || name.startsWith('stakeout_steal_')) {
+    return [
+      '等待目标好友作物接近成熟',
+      '准时进入好友农场执行偷取',
+      '记录本次蹲守结果',
+    ]
+  }
   if (TASK_META[name])
     return TASK_META[name].steps
   for (const [key, meta] of Object.entries(TASK_META)) {
@@ -937,8 +1048,61 @@ function clearFilter() {
   filter.value.module = ''
   filter.value.event = ''
   filter.value.keyword = ''
-  filter.value.isWarn = 'all'
+  filter.value.isWarn = ''
   refresh()
+}
+
+function buildDashboardViewState() {
+  return normalizeDashboardViewState(filter.value, DEFAULT_DASHBOARD_VIEW_STATE)
+}
+
+function applyDashboardViewState(state: Partial<typeof DEFAULT_DASHBOARD_VIEW_STATE> | null | undefined) {
+  dashboardViewHydrating = true
+  filter.value = { ...buildDashboardViewState(), ...normalizeDashboardViewState(state, DEFAULT_DASHBOARD_VIEW_STATE) }
+  dashboardViewHydrating = false
+}
+
+function clearDashboardViewSyncTimer() {
+  if (dashboardViewSyncTimer) {
+    clearTimeout(dashboardViewSyncTimer)
+    dashboardViewSyncTimer = null
+  }
+}
+
+function scheduleDashboardViewSync() {
+  clearDashboardViewSyncTimer()
+  const payload = buildDashboardViewState()
+  dashboardViewSyncTimer = setTimeout(async () => {
+    try {
+      await saveViewPreferences({
+        dashboardViewState: payload,
+      })
+    }
+    catch (error) {
+      console.warn('保存仪表盘视图偏好失败', error)
+    }
+  }, 240)
+}
+
+async function hydrateDashboardViewState() {
+  const localFallback = buildDashboardViewState()
+  try {
+    const payload = await fetchViewPreferences()
+    if (payload?.dashboardViewState) {
+      applyDashboardViewState(payload.dashboardViewState)
+      return
+    }
+    applyDashboardViewState(localFallback)
+    if (JSON.stringify(localFallback) !== JSON.stringify(DEFAULT_DASHBOARD_VIEW_STATE)) {
+      await saveViewPreferences({
+        dashboardViewState: localFallback,
+      })
+    }
+  }
+  catch (error) {
+    console.warn('读取仪表盘视图偏好失败', error)
+    applyDashboardViewState(localFallback)
+  }
 }
 
 // 【修复闪烁】监听 accountId 字符串值而非 currentAccount 对象引用
@@ -964,8 +1128,16 @@ watch(() => JSON.stringify(status.value?.operations || {}), (next, prev) => {
 })
 
 watch(hasActiveLogFilter, (enabled) => {
+  if (dashboardViewHydrating)
+    return
   statusStore.setRealtimeLogsEnabled(!enabled)
   refresh()
+})
+
+watch(dashboardViewSignature, () => {
+  if (!dashboardViewSyncEnabled || dashboardViewHydrating)
+    return
+  scheduleDashboardViewSync()
 })
 
 function onLogScroll(e: Event) {
@@ -988,10 +1160,16 @@ watch(allLogs, () => {
 
 const settingStore = useSettingStore()
 
-onMounted(() => {
+onMounted(async () => {
+  await hydrateDashboardViewState()
   statusStore.setRealtimeLogsEnabled(!hasActiveLogFilter.value)
-  refresh()
+  await refresh()
   settingStore.fetchTrialCardConfig()
+  dashboardViewSyncEnabled = true
+})
+
+onBeforeUnmount(() => {
+  clearDashboardViewSyncTimer()
 })
 
 // Auto refresh fallback every 10s (WS 断开或筛选条件启用时会回退 HTTP)
@@ -1055,11 +1233,11 @@ async function handleDashboardTrialRenew() {
       localStorage.setItem('current_user', JSON.stringify(user))
     }
     else {
-      console.warn(res.data.error || '续费失败')
+      console.warn(localizeRuntimeText(res.data.error || '续费失败'))
     }
   }
   catch (e: any) {
-    console.warn(e.response?.data?.error || e.message || '续费异常')
+    console.warn(localizeRuntimeText(e.response?.data?.error || e.message || '续费异常'))
   }
   finally {
     dashboardTrialRenewing.value = false
@@ -1068,7 +1246,7 @@ async function handleDashboardTrialRenew() {
 </script>
 
 <template>
-  <div class="flex flex-col gap-6 pt-6 md:h-full">
+  <div class="dashboard-page ui-page-shell flex flex-col gap-6 pt-6 md:h-full">
     <!-- 用户信息卡片 -->
     <UserInfoCard />
 
@@ -1326,6 +1504,10 @@ async function handleDashboardTrialRenew() {
             </div>
           </div>
 
+          <div class="mb-3 border border-sky-200/70 rounded-xl bg-sky-50/70 px-3 py-2 text-xs text-sky-700 leading-5 dark:border-sky-800/40 dark:bg-sky-900/15 dark:text-sky-200">
+            {{ DASHBOARD_BROWSER_PREF_NOTE }}
+          </div>
+
           <div ref="logContainer" class="max-h-[50vh] min-h-0 flex-1 overflow-y-auto border border-gray-200/20 rounded bg-transparent p-3 text-xs leading-relaxed font-mono md:max-h-none dark:border-gray-700/20" @scroll="onLogScroll">
             <div v-if="!allLogs.length" class="glass-text-muted py-8 text-center">
               暂无日志
@@ -1417,7 +1599,7 @@ async function handleDashboardTrialRenew() {
                       {{ task.group }}
                     </span>
                   </td>
-                  <td class="max-w-[180px] truncate px-2 py-1.5 font-medium" :title="task.name">
+                  <td class="max-w-[180px] truncate px-2 py-1.5 font-medium" :title="getTaskDisplayName(task.name)">
                     {{ getTaskDisplayName(task.name) }}
                   </td>
                   <td class="px-2 py-1.5 text-center">
@@ -1425,7 +1607,7 @@ async function handleDashboardTrialRenew() {
                       <span class="h-1.5 w-1.5 animate-pulse rounded-full bg-green-500" />
                       执行中
                     </span>
-                    <span v-else class="text-gray-400">等待中</span>
+                    <span v-else class="glass-text-muted">等待中</span>
                   </td>
                   <td class="px-2 py-1.5 text-right font-mono">
                     {{ getTaskCountdown(task) }}
@@ -1441,7 +1623,7 @@ async function handleDashboardTrialRenew() {
                     >
                       查看
                     </button>
-                    <span v-else class="text-gray-300">-</span>
+                    <span v-else class="glass-text-muted">-</span>
                   </td>
                 </tr>
               </tbody>
@@ -1536,27 +1718,48 @@ async function handleDashboardTrialRenew() {
 </template>
 
 <style scoped>
+.dashboard-page {
+  color: var(--ui-text-1);
+}
+
+.dashboard-page :is(.text-gray-500, .text-gray-400, .text-gray-300, .glass-text-muted) {
+  color: var(--ui-text-2) !important;
+}
+
+.dashboard-page [class*='border-gray-100/'],
+.dashboard-page [class*='border-gray-700/'],
+.dashboard-page [class*='border-white/10'] {
+  border-color: var(--ui-border-subtle) !important;
+}
+
+.dashboard-page [class*='bg-gray-100/50'],
+.dashboard-page [class*='bg-gray-700/30'],
+.dashboard-page [class*='bg-black/5'],
+.dashboard-page [class*='dark:bg-white/5'] {
+  background-color: color-mix(in srgb, var(--ui-bg-surface) 62%, transparent) !important;
+}
+
 .trial-pulse-banner {
-  border: 1px solid rgba(249, 115, 22, 0.3);
+  border: 1px solid color-mix(in srgb, var(--ui-status-warning) 30%, transparent);
   animation: trial-pulse 2.5s infinite ease-in-out;
 }
 
 @keyframes trial-pulse {
   0% {
-    box-shadow: 0 0 0 0 rgba(249, 115, 22, 0.2);
-    border-color: rgba(249, 115, 22, 0.3);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--ui-status-warning) 20%, transparent);
+    border-color: color-mix(in srgb, var(--ui-status-warning) 30%, transparent);
   }
   50% {
-    box-shadow: 0 0 15px 2px rgba(249, 115, 22, 0.15);
-    border-color: rgba(249, 115, 22, 0.6);
+    box-shadow: 0 0 15px 2px color-mix(in srgb, var(--ui-status-warning) 15%, transparent);
+    border-color: color-mix(in srgb, var(--ui-status-warning) 60%, transparent);
   }
   100% {
-    box-shadow: 0 0 0 0 rgba(249, 115, 22, 0.2);
-    border-color: rgba(249, 115, 22, 0.3);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--ui-status-warning) 20%, transparent);
+    border-color: color-mix(in srgb, var(--ui-status-warning) 30%, transparent);
   }
 }
 
 .dark .trial-pulse-banner {
-  border-color: rgba(249, 115, 22, 0.2);
+  border-color: color-mix(in srgb, var(--ui-status-warning) 20%, transparent);
 }
 </style>
