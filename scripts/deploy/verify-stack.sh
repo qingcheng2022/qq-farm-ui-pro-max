@@ -11,6 +11,7 @@ REPO_SLUG="${REPO_SLUG:-smdk000/qq-farm-ui-pro-max}"
 REPO_REF="${REPO_REF:-main}"
 RAW_BASE_URL="${RAW_BASE_URL:-https://raw.githubusercontent.com/${REPO_SLUG}/${REPO_REF}}"
 APP_SERVICE="${APP_SERVICE:-qq-farm-bot}"
+COMPOSE_APP_SERVICE="${COMPOSE_APP_SERVICE:-${APP_SERVICE}}"
 APP_CONTAINER_NAME_INPUT="${APP_CONTAINER_NAME:-}"
 APP_CONTAINER_NAME="${APP_CONTAINER_NAME_INPUT:-${STACK_NAME}-bot}"
 MYSQL_SERVICE="${MYSQL_SERVICE:-mysql}"
@@ -327,7 +328,7 @@ app_exec_node() {
     for pair in "$@"; do
         env_args+=(-e "${pair}")
     done
-    "${DOCKER[@]}" compose exec -T "${env_args[@]}" "${APP_SERVICE}" node -e "${script}"
+    "${DOCKER[@]}" compose exec -T "${env_args[@]}" "${COMPOSE_APP_SERVICE}" node -e "${script}"
 }
 
 check_app_service() {
@@ -377,7 +378,7 @@ check_mysql_service() {
     if is_local_mysql_target; then
         check_container "${MYSQL_CONTAINER_NAME}" "MySQL" "1" || true
 
-        if "${DOCKER[@]}" compose exec -T "${MYSQL_SERVICE}" mysqladmin --protocol=TCP -h 127.0.0.1 -u root -p"${MYSQL_ROOT_PASSWORD}" ping >/dev/null 2>&1; then
+        if "${DOCKER[@]}" exec -i "${MYSQL_CONTAINER_NAME}" mysqladmin --protocol=TCP -h 127.0.0.1 -u root -p"${MYSQL_ROOT_PASSWORD}" ping >/dev/null 2>&1; then
             record_success "MySQL root 连通正常: root@127.0.0.1:3306"
         else
             record_failure "MySQL root 连通失败: root@127.0.0.1:3306"
@@ -405,13 +406,13 @@ check_redis_service() {
         check_container "${REDIS_CONTAINER_NAME}" "Redis" "0" || true
 
         if [ -n "${REDIS_PASSWORD:-}" ]; then
-            if "${DOCKER[@]}" compose exec -T -e REDISCLI_AUTH="${REDIS_PASSWORD}" "${REDIS_SERVICE}" redis-cli ping >/dev/null 2>&1; then
+            if "${DOCKER[@]}" exec -i -e REDISCLI_AUTH="${REDIS_PASSWORD}" "${REDIS_CONTAINER_NAME}" redis-cli ping >/dev/null 2>&1; then
                 record_success "Redis 密码连通正常: redis:6379"
             else
                 record_failure "Redis 密码连通失败: redis:6379"
             fi
         else
-            if "${DOCKER[@]}" compose exec -T "${REDIS_SERVICE}" redis-cli ping >/dev/null 2>&1; then
+            if "${DOCKER[@]}" exec -i "${REDIS_CONTAINER_NAME}" redis-cli ping >/dev/null 2>&1; then
                 record_success "Redis 连通正常: redis:6379"
             else
                 record_failure "Redis 连通失败: redis:6379"
@@ -438,7 +439,7 @@ check_ipad860_service() {
         check_container "${IPAD860_CONTAINER_NAME}" "微信扫码服务" "0" || true
 
         local configured_pass=""
-        configured_pass="$("${DOCKER[@]}" compose exec -T "${IPAD860_SERVICE}" sh -lc "grep '^redispass = ' /app/conf/app.conf | sed -E 's/^redispass = \\\"(.*)\\\"$/\\1/'" 2>/dev/null || true)"
+        configured_pass="$("${DOCKER[@]}" exec -i "${IPAD860_CONTAINER_NAME}" sh -lc "grep '^redispass = ' /app/conf/app.conf | sed -E 's/^redispass = \\\"(.*)\\\"$/\\1/'" 2>/dev/null || true)"
         if [ "${configured_pass}" = "${REDIS_PASSWORD:-}" ]; then
             record_success "ipad860 Redis 密码配置一致"
         else
